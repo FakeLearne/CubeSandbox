@@ -58,6 +58,7 @@
 
 /* Offsets to the start of the packet */
 #define IP_CSUM_OFF			(sizeof(struct ethhdr) + offsetof(struct iphdr, check))
+#define IP_TOT_LEN_OFF			(sizeof(struct ethhdr) + offsetof(struct iphdr, tot_len))
 #define IP_SADDR_OFF			(sizeof(struct ethhdr) + offsetof(struct iphdr, saddr))
 #define IP_DADDR_OFF			(sizeof(struct ethhdr) + offsetof(struct iphdr, daddr))
 #define TCP_CSUM_OFF(LEN)		(sizeof(struct ethhdr) + LEN + offsetof(struct tcphdr, check))
@@ -190,13 +191,6 @@ struct mvm_port {
 	__u16 reserved;
 };
 
-/* The size of this structure must be a multiple of 4 */
-struct csum_buff {
-	__u32 addr;
-	__u16 port;
-	__u16 reserved;
-};
-
 struct session_key {
 	__u32 src_ip;
 	__u32 dst_ip;
@@ -247,19 +241,12 @@ static __always_inline int _()
 	int h[sizeof(struct dns_query_track_key) == 24 ? 1 : -1] = {};
 	int i[sizeof(struct dns_query_track_value) == 16 ? 1 : -1] = {};
 	int l[sizeof(struct mvm_port) == 8 ? 1 : -1] = {};
-	int m[sizeof(struct csum_buff) % 4 == 0 ? 1 : -1] = {};
 	int n[sizeof(struct session_key) % 20 == 0 ? 1 : -1] = {};
 	int o[sizeof(struct nat_session) % 64 == 0 ? 1 : -1] = {};
 	int p[sizeof(struct ingress_session) % 16 == 0 ? 1 : -1] = {};
 	int q[sizeof(struct snat_ip) % 16 == 0 ? 1 : -1] = {};
 
-	return b[0] + d[0] + r[0] + f[0] + g[0] + h[0] + i[0] + l[0] + m[0] + n[0] + o[0] + p[0] + q[0];
-}
-
-static __always_inline __u16 csum_fold(__wsum sum)
-{
-	sum = (sum & 0xffff) + (sum >> 16);
-	return ~((sum & 0xffff) + (sum >> 16));
+	return b[0] + d[0] + r[0] + f[0] + g[0] + h[0] + i[0] + l[0] + n[0] + o[0] + p[0] + q[0];
 }
 
 #endif /* __CUBEVS_H */

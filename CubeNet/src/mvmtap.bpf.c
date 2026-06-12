@@ -170,19 +170,6 @@ static __always_inline bool should_redirect_to_l7_proxy(const struct net_policy_
 	return l4->dest == bpf_htons(80) || l4->dest == bpf_htons(443);
 }
 
-struct tcp_ipv4_pseudo_header {
-	__u32 saddr;
-	__u32 daddr;
-	__u8 zero;
-	__u8 protocol;
-	__u16 length;
-};
-
-struct ip_tot_len_csum {
-	__u16 tot_len;
-	__u16 padding;
-};
-
 enum tcp_nat_result {
 	TCP_NAT_DROP = 0,
 	TCP_NAT_OK,
@@ -222,34 +209,77 @@ static __always_inline bool tcp_segment_len(const struct iphdr *l3, const struct
 	return true;
 }
 
-static __always_inline void rewrite_l3_tot_len(struct iphdr *l3, __u16 new_tot_len)
+/* Update the IP tot_len field together with the IP header checksum.
+ * Uses bpf_l3_csum_replace for the incremental csum update and
+ * bpf_skb_store_bytes to write the new value, instead of touching the
+ * packet pointer directly.
+ */
+static __always_inline int rewrite_l3_tot_len(struct __sk_buff *skb,
+					      __be16 old_tot_len, __be16 new_tot_len)
 {
-	struct ip_tot_len_csum old_len = { .tot_len = l3->tot_len };
-	struct ip_tot_len_csum new_len = { .tot_len = new_tot_len };
-	__u32 old_csum = l3->check;
-	__u32 new_csum;
+	long err;
 
-	new_csum = bpf_csum_diff((void *)&old_len, sizeof(old_len),
-				 (void *)&new_len, sizeof(new_len), ~old_csum);
-	l3->check = csum_fold(new_csum);
-	l3->tot_len = new_tot_len;
+	err = bpf_l3_csum_replace(skb, IP_CSUM_OFF, old_tot_len, new_tot_len,
+				  sizeof(new_tot_len));
+	if (err)
+		return err;
+
+	return bpf_skb_store_bytes(skb, IP_TOT_LEN_OFF, &new_tot_len,
+				   sizeof(new_tot_len), 0);
 }
 
-static __always_inline __u16 tcp_ipv4_checksum(__u32 saddr, __u32 daddr,
-					       const struct tcphdr *tcp)
+/* Set the TCP checksum field of a freshly written TCP header.
+ *
+ * Pre-condition: the TCP header at @tcp_csum_off..+sizeof(*tcp) is already
+ * present in skb with the check field cleared to 0. This helper folds the
+ * IPv4 pseudo-header (saddr, daddr, proto, length) and the on-wire TCP
+ * header bytes into the checksum via bpf_l4_csum_replace.
+ *
+ * Per the bpf-helpers(7) man page, calling bpf_l4_csum_replace with
+ * from = 0 makes the helper recompute the csum against `to` only — i.e.
+ * accumulates `to` into the existing in-place checksum. We start from a
+ * zeroed check field and add each 32-bit word in turn.
+ */
+static __always_inline int tcp_ipv4_set_checksum(struct __sk_buff *skb,
+						 __u32 tcp_csum_off,
+						 __be32 saddr, __be32 daddr,
+						 const struct tcphdr *tcp)
 {
-	struct tcp_ipv4_pseudo_header pseudo = {
-		.saddr = saddr,
-		.daddr = daddr,
-		.protocol = IPPROTO_TCP,
-		.length = bpf_htons(sizeof(*tcp)),
-	};
-	__u32 csum;
+	const __u32 *words = (const __u32 *)tcp;
+	/* zero | proto | length, in network byte order */
+	__be32 proto_len = bpf_htonl(((__u32)IPPROTO_TCP << 16) | sizeof(*tcp));
+	__u64 ph_flags = BPF_F_PSEUDO_HDR | sizeof(__u32);
+	__u64 hdr_flags = sizeof(__u32);
+	long err;
 
-	csum = bpf_csum_diff(NULL, 0, (void *)&pseudo, sizeof(pseudo), 0);
-	csum = bpf_csum_diff(NULL, 0, (void *)tcp, sizeof(*tcp), csum);
+	/* Pseudo-header words */
+	err = bpf_l4_csum_replace(skb, tcp_csum_off, 0, saddr, ph_flags);
+	if (err)
+		return err;
+	err = bpf_l4_csum_replace(skb, tcp_csum_off, 0, daddr, ph_flags);
+	if (err)
+		return err;
+	err = bpf_l4_csum_replace(skb, tcp_csum_off, 0, proto_len, ph_flags);
+	if (err)
+		return err;
 
-	return csum_fold(csum);
+	/* TCP header words: source|dest, seq, ack_seq, doff/flags/window,
+	 * check|urg_ptr. The check word currently contains 0 (caller wrote
+	 * a zeroed check field), so adding it is a no-op for the csum.
+	 */
+	err = bpf_l4_csum_replace(skb, tcp_csum_off, 0, words[0], hdr_flags);
+	if (err)
+		return err;
+	err = bpf_l4_csum_replace(skb, tcp_csum_off, 0, words[1], hdr_flags);
+	if (err)
+		return err;
+	err = bpf_l4_csum_replace(skb, tcp_csum_off, 0, words[2], hdr_flags);
+	if (err)
+		return err;
+	err = bpf_l4_csum_replace(skb, tcp_csum_off, 0, words[3], hdr_flags);
+	if (err)
+		return err;
+	return bpf_l4_csum_replace(skb, tcp_csum_off, 0, words[4], hdr_flags);
 }
 
 static __always_inline int tcp_reply_reset(struct __sk_buff *skb, __u32 ifindex)
@@ -258,10 +288,12 @@ static __always_inline int tcp_reply_reset(struct __sk_buff *skb, __u32 ifindex)
 	struct ethhdr *l2;
 	struct iphdr *l3;
 	struct tcphdr *l4;
-	__u32 new_saddr, new_daddr;
+	__be32 old_saddr, old_daddr, new_saddr, new_daddr;
+	__be16 old_tot_len, new_tot_len;
 	__u32 seq, ack_seq, new_skb_len;
-	__u32 seg_len;
+	__u32 seg_len, tcp_off, tcp_csum_off;
 	__u16 ip_hlen, new_ip_len;
+	long err;
 
 	/* bpf_skb_change_tail() may fail on GSO skbs or leave segmentation
 	 * state inconsistent. Fall back to drop instead of sending RST.
@@ -298,6 +330,10 @@ static __always_inline int tcp_reply_reset(struct __sk_buff *skb, __u32 ifindex)
 		new_tcp.ack_seq = bpf_htonl(bpf_ntohl(seq) + seg_len);
 		new_tcp.ack = 1;
 	}
+	/* Build the new TCP header with check = 0; tcp_ipv4_set_checksum()
+	 * folds the pseudo-header and TCP header words into the checksum
+	 * incrementally via bpf_l4_csum_replace.
+	 */
 
 	new_ip_len = ip_hlen + sizeof(new_tcp);
 	new_skb_len = sizeof(struct ethhdr) + new_ip_len;
@@ -308,14 +344,54 @@ static __always_inline int tcp_reply_reset(struct __sk_buff *skb, __u32 ifindex)
 	if (!__pull_headers(skb, &l2, &l3, &l4))
 		return TC_ACT_SHOT;
 
-	new_tcp.check = tcp_ipv4_checksum(new_saddr, new_daddr, &new_tcp);
-	*l4 = new_tcp;
-
-	rewrite_l3_tot_len(l3, bpf_htons(new_ip_len));
-	rewrite_l3_addr(l3, &l3->saddr, new_saddr);
-	rewrite_l3_addr(l3, &l3->daddr, new_daddr);
+	/* Snapshot old IP header fields and rewrite the L2 MAC pair before
+	 * touching the packet via BPF helpers — bpf_skb_store_bytes() and
+	 * bpf_l{3,4}_csum_replace() invalidate l2/l3/l4 pointers.
+	 */
+	old_saddr = l3->saddr;
+	old_daddr = l3->daddr;
+	old_tot_len = l3->tot_len;
+	new_tot_len = bpf_htons(new_ip_len);
+	tcp_off = sizeof(struct ethhdr) + ip_hlen;
+	tcp_csum_off = TCP_CSUM_OFF(ip_hlen);
 	set_mac_pair(l2, cubegw0_macaddr_p1, cubegw0_macaddr_p2,
 		     mvm_macaddr_p1, mvm_macaddr_p2);
+
+	/* Write the new TCP header (with check = 0). */
+	err = bpf_skb_store_bytes(skb, tcp_off, &new_tcp, sizeof(new_tcp), 0);
+	if (err)
+		return TC_ACT_SHOT;
+
+	/* Update IP tot_len + IP csum. */
+	err = rewrite_l3_tot_len(skb, old_tot_len, new_tot_len);
+	if (err)
+		return TC_ACT_SHOT;
+
+	/* Update IP saddr + IP csum. */
+	err = bpf_l3_csum_replace(skb, IP_CSUM_OFF, old_saddr, new_saddr,
+				  sizeof(new_saddr));
+	if (err)
+		return TC_ACT_SHOT;
+	err = bpf_skb_store_bytes(skb, IP_SADDR_OFF, &new_saddr,
+				  sizeof(new_saddr), 0);
+	if (err)
+		return TC_ACT_SHOT;
+
+	/* Update IP daddr + IP csum. */
+	err = bpf_l3_csum_replace(skb, IP_CSUM_OFF, old_daddr, new_daddr,
+				  sizeof(new_daddr));
+	if (err)
+		return TC_ACT_SHOT;
+	err = bpf_skb_store_bytes(skb, IP_DADDR_OFF, &new_daddr,
+				  sizeof(new_daddr), 0);
+	if (err)
+		return TC_ACT_SHOT;
+
+	/* Compute the TCP checksum into the (currently zero) check field. */
+	err = tcp_ipv4_set_checksum(skb, tcp_csum_off, new_saddr, new_daddr,
+				    &new_tcp);
+	if (err)
+		return TC_ACT_SHOT;
 
 	return bpf_redirect(ifindex, 0);
 }
