@@ -630,9 +630,6 @@ pub(crate) fn build_cube_network_config(
     allow_internet_access: Option<bool>,
     network: Option<&SandboxNetworkConfig>,
 ) -> AppResult<Option<CubeNetworkConfig>> {
-    let effective_allow = network
-        .and_then(|n| n.allow_public_traffic)
-        .or(allow_internet_access);
     let allow_out = network
         .and_then(|n| n.allow_out.clone())
         .unwrap_or_default();
@@ -640,7 +637,7 @@ pub(crate) fn build_cube_network_config(
     validate_allow_out_domains_require_deny_all(
         &allow_out,
         &deny_out,
-        effective_allow == Some(false),
+        allow_internet_access == Some(false),
     )?;
 
     let rules: Vec<CubeEgressRule> = network
@@ -648,13 +645,16 @@ pub(crate) fn build_cube_network_config(
         .map(|rs| rs.iter().map(map_egress_rule).collect())
         .unwrap_or_default();
 
-    if effective_allow.is_none() && allow_out.is_empty() && deny_out.is_empty() && rules.is_empty()
+    if allow_internet_access.is_none()
+        && allow_out.is_empty()
+        && deny_out.is_empty()
+        && rules.is_empty()
     {
         return Ok(None);
     }
 
     Ok(Some(CubeNetworkConfig {
-        allow_internet_access: effective_allow,
+        allow_internet_access,
         allow_out,
         deny_out,
         rules,
@@ -715,7 +715,7 @@ mod tests {
     }
 
     #[test]
-    fn network_context_prefers_explicit_network_config() {
+    fn network_context_ignores_allow_public_traffic_for_outbound_access() {
         let context = build_cube_network_config(
             Some(false),
             Some(&SandboxNetworkConfig {
@@ -729,7 +729,7 @@ mod tests {
         .expect("network config should be valid")
         .expect("context should exist");
 
-        assert_eq!(context.allow_internet_access, Some(true));
+        assert_eq!(context.allow_internet_access, Some(false));
         assert_eq!(context.allow_out, vec!["github.com".to_string()]);
     }
 
@@ -753,11 +753,30 @@ mod tests {
     }
 
     #[test]
-    fn network_context_accepts_allow_out_domain_when_public_traffic_disabled() {
-        let context = build_cube_network_config(
+    fn network_context_rejects_allow_out_domain_when_only_allow_public_traffic_disabled() {
+        let err = build_cube_network_config(
             None,
             Some(&SandboxNetworkConfig {
                 allow_public_traffic: Some(false),
+                allow_out: Some(vec!["api.example.com".to_string()]),
+                deny_out: None,
+                mask_request_host: None,
+                rules: None,
+            }),
+        )
+        .unwrap_err();
+
+        assert!(err
+            .to_string()
+            .contains("must disable public outbound traffic or include '0.0.0.0/0' in deny_out"));
+    }
+
+    #[test]
+    fn network_context_accepts_allow_out_domain_when_internet_access_disabled() {
+        let context = build_cube_network_config(
+            Some(false),
+            Some(&SandboxNetworkConfig {
+                allow_public_traffic: Some(true),
                 allow_out: Some(vec!["api.example.com".to_string()]),
                 deny_out: None,
                 mask_request_host: None,
