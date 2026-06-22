@@ -64,15 +64,21 @@ download_ca_from_master() {
   local filename="$1"  # e.g. cube-root-ca.crt
   local tmp="$2"
 
-  local addr url http_code
+  local addr url http_code curl_status
   addr="$(resolve_control_plane_cubemaster_addr)"
   url="http://${addr}/cube/ca/${filename}"
 
   log "fetching ${url}"
-  http_code="$(curl -fsSL --max-time 30 -o "${tmp}" -w '%{http_code}' "${url}" || true)"
+  if http_code="$(curl -sS -L --max-time 30 -o "${tmp}" -w '%{http_code}' "${url}")"; then
+    :
+  else
+    curl_status=$?
+    rm -f "${tmp}"
+    die "network error reaching ${url} (curl exit ${curl_status}); is the master reachable?"
+  fi
   if [[ "${http_code}" != "200" ]]; then
     rm -f "${tmp}"
-    die "fetch ${url} failed (HTTP ${http_code:-unknown}); is the master up and the CA generated there?"
+    die "fetch ${url} failed (HTTP ${http_code}); is the master up and the CA generated there?"
   fi
 
   # Sanity: a zero-byte body means the master served an empty file,
@@ -92,13 +98,20 @@ fetch_compute_ca_from_master() {
   download_ca_from_master "cube-root-ca.crt" "${tmp_crt}"
   download_ca_from_master "cube-root-ca.key" "${tmp_key}"
 
-  cert_pubhash="$(openssl x509 -in "${tmp_crt}" -noout -pubkey 2>/dev/null \
-    | openssl pkey -pubin -outform DER 2>/dev/null \
-    | openssl dgst -sha256 \
-    || true)"
-  key_pubhash="$(openssl pkey -in "${tmp_key}" -pubout -outform DER 2>/dev/null \
-    | openssl dgst -sha256 \
-    || true)"
+  if cert_pubhash="$(openssl x509 -in "${tmp_crt}" -noout -pubkey \
+    | openssl pkey -pubin -outform DER \
+    | openssl dgst -sha256)"; then
+    :
+  else
+    die "downloaded cube-root-ca.crt is not a parseable certificate"
+  fi
+
+  if key_pubhash="$(openssl pkey -in "${tmp_key}" -pubout -outform DER \
+    | openssl dgst -sha256)"; then
+    :
+  else
+    die "downloaded cube-root-ca.key is not a parseable private key"
+  fi
   [[ -n "${cert_pubhash}" ]] || die "downloaded cube-root-ca.crt is not a parseable certificate"
   [[ -n "${key_pubhash}" ]] || die "downloaded cube-root-ca.key is not a parseable private key"
   [[ "${cert_pubhash}" == "${key_pubhash}" ]] || die "downloaded CubeEgress CA cert and key do not match"
