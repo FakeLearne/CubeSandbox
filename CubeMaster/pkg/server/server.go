@@ -102,6 +102,7 @@ func (s *internalHttp) registerHandlers() {
 	cubeGroup.HandleFunc(cube.TemplateBuildStatusAction+"/{build_id}/status", cube.HttpHandler).Methods(http.MethodGet)
 	cubeGroup.HandleFunc(cube.TemplateFromImageAction, cube.HttpHandler).Methods(http.MethodGet, http.MethodPost)
 	cubeGroup.HandleFunc(cube.TemplateArtifactDownloadAction, cube.HttpHandler).Methods(http.MethodGet, http.MethodHead)
+	cubeGroup.HandleFunc(cube.CADownloadActionPrefix+"{filename}", cube.HttpHandler).Methods(http.MethodGet, http.MethodHead)
 	cubeGroup.HandleFunc(cube.RootfsArtifactAction, cube.HttpHandler).Methods(http.MethodGet)
 	cubeGroup.HandleFunc(cube.ListInventoryAction, cube.HttpHandler).Methods(http.MethodPost)
 	cubeGroup.HandleFunc(cube.SandboxLogsAction, cube.HttpHandler).Methods(http.MethodGet, http.MethodPost)

@@ -18,13 +18,12 @@
 #
 # Source-of-truth model:
 #   control role  – generate locally if missing
-#   compute role  – pull from master via GET /cube/ca/<filename>;
-#                   never auto-generate (would diverge from master)
+#   compute role  – always pull from master via GET /cube/ca/<filename>;
+#                   never auto-generate or trust stale local files
 #
-# Idempotent: every file is generated/pulled only when missing, so
-# re-running this prepare step on an already-initialised host is a
-# no-op and does NOT rotate the CA. To rotate, the operator removes
-# the files (cluster-wide) and lets the master regenerate.
+# Idempotent: control nodes keep their existing CA unless the operator
+# deliberately removes it. Compute nodes refresh from master on every run
+# so reused hosts and CA rotations converge back to the cluster root CA.
 
 set -euo pipefail
 
@@ -55,32 +54,24 @@ WORKER_GID="${CUBE_EGRESS_WORKER_GID:-8049}"
 mkdir -p "${CA_DIR}"
 chmod 0755 "${CA_DIR}"
 
-# fetch_ca_from_master pulls a single CA file (cert or key) from the
-# master node's /cube/ca/<filename> endpoint into a final path with
-# matching ownership and permissions. Caller decides which file +
-# what mode/group; the function only handles the transport.
+# download_ca_from_master pulls a single CA file (cert or key) from the
+# master node's /cube/ca/<filename> endpoint into a caller-owned temp path.
 #
-# Strategy: download to a temp file, then atomic-rename. Avoids leaving
-# a half-written CA on disk if curl is interrupted.
-fetch_ca_from_master() {
+# Strategy: the compute branch downloads both cert and key first, verifies
+# they match, then installs them. This avoids leaving a mismatched local CA
+# pair behind if only one request succeeds.
+download_ca_from_master() {
   local filename="$1"  # e.g. cube-root-ca.crt
-  local dest="$2"
-  local mode="$3"      # e.g. 0644
-  local owner="$4"     # e.g. root:root
+  local tmp="$2"
 
-  local addr url tmp http_code
+  local addr url http_code
   addr="$(resolve_control_plane_cubemaster_addr)"
   url="http://${addr}/cube/ca/${filename}"
 
-  tmp="$(mktemp -p "${CA_DIR}" ".${filename}.download.XXXXXX")"
-  # shellcheck disable=SC2064
-  trap "rm -f '${tmp}'" EXIT
-
-  log "fetching ${url} → ${dest}"
+  log "fetching ${url}"
   http_code="$(curl -fsSL --max-time 30 -o "${tmp}" -w '%{http_code}' "${url}" || true)"
   if [[ "${http_code}" != "200" ]]; then
     rm -f "${tmp}"
-    trap - EXIT
     die "fetch ${url} failed (HTTP ${http_code:-unknown}); is the master up and the CA generated there?"
   fi
 
@@ -88,25 +79,44 @@ fetch_ca_from_master() {
   # which would later trip up CubeEgress's start.sh openssl checks.
   if [[ ! -s "${tmp}" ]]; then
     rm -f "${tmp}"
-    trap - EXIT
     die "fetched ${url} is empty"
   fi
+}
 
-  install -m "${mode}" -o "${owner%:*}" -g "${owner#*:}" "${tmp}" "${dest}"
-  rm -f "${tmp}"
+fetch_compute_ca_from_master() {
+  local tmp_crt tmp_key cert_pubhash key_pubhash
+  tmp_crt="$(mktemp -p "${CA_DIR}" ".cube-root-ca.crt.download.XXXXXX")"
+  tmp_key="$(mktemp -p "${CA_DIR}" ".cube-root-ca.key.download.XXXXXX")"
+  trap 'rm -f "${tmp_crt}" "${tmp_key}"' EXIT
+
+  download_ca_from_master "cube-root-ca.crt" "${tmp_crt}"
+  download_ca_from_master "cube-root-ca.key" "${tmp_key}"
+
+  cert_pubhash="$(openssl x509 -in "${tmp_crt}" -noout -pubkey 2>/dev/null \
+    | openssl pkey -pubin -outform DER 2>/dev/null \
+    | openssl dgst -sha256 \
+    || true)"
+  key_pubhash="$(openssl pkey -in "${tmp_key}" -pubout -outform DER 2>/dev/null \
+    | openssl dgst -sha256 \
+    || true)"
+  [[ -n "${cert_pubhash}" ]] || die "downloaded cube-root-ca.crt is not a parseable certificate"
+  [[ -n "${key_pubhash}" ]] || die "downloaded cube-root-ca.key is not a parseable private key"
+  [[ "${cert_pubhash}" == "${key_pubhash}" ]] || die "downloaded CubeEgress CA cert and key do not match"
+
+  install -m 0644 -o root -g root "${tmp_crt}" "${CA_CERT}"
+  install -m 0640 -o root -g "${WORKER_GID}" "${tmp_key}" "${CA_KEY}"
+  rm -f "${tmp_crt}" "${tmp_key}"
   trap - EXIT
 }
 
-if [[ -f "${CA_CERT}" && -f "${CA_KEY}" ]]; then
+if is_compute_role; then
+  # Compute role: always refresh from master. Reused hosts may have a
+  # stale local CA from an older cluster, and trusting that would break
+  # templates baked with the master's current root CA.
+  log "compute role detected; refreshing CA from master"
+  fetch_compute_ca_from_master
+elif [[ -f "${CA_CERT}" && -f "${CA_KEY}" ]]; then
   log "CA already present at ${CA_DIR}; leaving as-is"
-elif is_compute_role; then
-  # Compute role: never generate locally — that would create a CA
-  # that diverges from the master's, and templates baked on master
-  # would not be trusted by sandboxes whose traffic this node's
-  # CubeEgress signs. Pull both files from the master instead.
-  log "compute role detected; pulling CA from master"
-  fetch_ca_from_master "cube-root-ca.crt" "${CA_CERT}" 0644 "root:root"
-  fetch_ca_from_master "cube-root-ca.key" "${CA_KEY}"  0640 "root:${WORKER_GID}"
 else
   log "control role; generating CubeEgress root CA at ${CA_DIR}"
   # ECDSA P-256, 10 years, no passphrase. Subject CN identifies the
