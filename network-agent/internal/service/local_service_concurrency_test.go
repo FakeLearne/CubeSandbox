@@ -80,6 +80,7 @@ func newConcurrencyTestService(t *testing.T) *localService {
 	if err != nil {
 		t.Fatalf("newIPAllocator error=%v", err)
 	}
+	allocator.ReserveLastUsable(2)
 	return &localService{
 		store:             store,
 		allocator:         allocator,
@@ -130,9 +131,9 @@ func TestEnsureNetworkConcurrentSameSandboxDeduplicates(t *testing.T) {
 	if got := atomic.LoadInt32(&created); got != 1 {
 		t.Fatalf("newTap created=%d, want 1 (dedup failed)", got)
 	}
-	// reserved network/gateway/broadcast (3) + exactly one allocated IP.
-	if svc.allocator.usedIPNum != 4 {
-		t.Fatalf("usedIPNum=%d, want 4 (one IP allocated)", svc.allocator.usedIPNum)
+	// reserved network/gateway/broadcast + two cube-router guard IPs + one allocated IP.
+	if svc.allocator.usedIPNum != 6 {
+		t.Fatalf("usedIPNum=%d, want 6 (one IP allocated)", svc.allocator.usedIPNum)
 	}
 	for i := 1; i < n; i++ {
 		if resps[i].PersistMetadata["sandbox_ip"] != resps[0].PersistMetadata["sandbox_ip"] {

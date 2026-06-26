@@ -46,6 +46,12 @@ ip() {
           printf '3: z192.168.0.10: <BROADCAST,UP,LOWER_UP> mtu 1500\n'
           printf '    inet 192.168.0.10/32 scope global z192.168.0.10\n'
           ;;
+        cube_router_residue)
+          printf '2: cube-dev: <BROADCAST,NOARP,UP,LOWER_UP> mtu 1500\n'
+          printf '    inet 192.168.0.1/18 brd 192.168.63.255 scope global cube-dev\n'
+          printf '3: cube-router: <BROADCAST,NOARP,UP,LOWER_UP> mtu 1500\n'
+          printf '    inet 192.168.63.253/32 scope global cube-router\n'
+          ;;
         host_overlap)
           printf '2: eth0: <BROADCAST,MULTICAST,UP,LOWER_UP> mtu 1500\n'
           printf '    inet 192.168.0.5/24 brd 192.168.0.255 scope global eth0\n'
@@ -62,6 +68,10 @@ ip() {
         cube_same | cube_overlap)
           printf '192.168.0.0/18 dev cube-dev proto kernel scope link src 192.168.0.1\n'
           printf '192.168.0.10/32 dev z192.168.0.10 scope link\n'
+          ;;
+        cube_router_residue)
+          printf '192.168.0.0/18 dev cube-dev proto kernel scope link src 192.168.0.1\n'
+          printf '192.168.63.254/32 dev cube-router scope link\n'
           ;;
         host_overlap)
           printf '192.168.0.0/24 dev eth0 proto kernel scope link src 192.168.0.5\n'
@@ -114,6 +124,10 @@ test_allows_same_cidr_cube_dev_reinstall() {
   TEST_RESOLV_CANDIDATES="" IP_SCENARIO=cube_same check_cidr_preflight "192.168.0.0/18" >/dev/null 2>&1
 }
 
+test_allows_cube_router_residue_reinstall() {
+  TEST_RESOLV_CANDIDATES="" IP_SCENARIO=cube_router_residue check_cidr_preflight "192.168.0.0/18" >/dev/null 2>&1
+}
+
 test_rejects_overlapping_cube_dev_cidr_change() {
   local output
   if output="$(TEST_RESOLV_CANDIDATES="" IP_SCENARIO=cube_overlap check_cidr_preflight "192.168.0.0/17" 2>&1)"; then
@@ -154,6 +168,7 @@ test_skip_conflict_allows_host_overlap() {
 test_rejects_nameserver_overlap
 test_dedupes_equivalent_resolver_paths
 test_allows_same_cidr_cube_dev_reinstall
+test_allows_cube_router_residue_reinstall
 test_rejects_overlapping_cube_dev_cidr_change
 test_rejects_host_interface_overlap
 test_custom_label_is_used_for_format_errors

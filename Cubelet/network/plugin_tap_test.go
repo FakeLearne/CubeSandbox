@@ -31,10 +31,15 @@ func TestGetGwIPAndMask(t *testing.T) {
 		},
 		{
 			name:     "small-subnet",
-			cidr:     "10.0.0.0/30",
+			cidr:     "10.0.0.0/29",
 			wantIP:   "10.0.0.1",
-			wantMask: 30,
+			wantMask: 29,
 			wantErr:  false,
+		},
+		{
+			name:    "mask-too-large",
+			cidr:    "10.0.0.0/30",
+			wantErr: true,
 		},
 		{
 			name:    "invalid-cidr",

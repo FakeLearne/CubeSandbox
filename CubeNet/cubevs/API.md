@@ -95,7 +95,7 @@ TAP 设备是虚拟网络接口，用于虚拟机网络通信。
 |---------|------|------|------|
 | `from_envoy` | `programNameFromEnvoy` | cubevs.go:78 | cubegw0 上的 TC 出站过滤器 |
 | `from_cube` | `programNameFromCube` | cubevs.go:79 | TAP 设备上的 TC 入站过滤器 |
-| `from_world` | `programNameFromWorld` | cubevs.go:80 | eth0 上的 TC 入站过滤器 |
+| `from_world` | `programNameFromWorld` | cubevs.go:80 | 主网卡 TC ingress 与 cube-router TC egress 共用的回包处理程序 |
 
 ## 项目结构
 

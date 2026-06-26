@@ -34,26 +34,29 @@ func main() {
 	flag.BoolVar(&showVersion, "version", false, "show version information")
 	flag.BoolVar(&showVersion, "v", false, "show version information")
 	var (
-		listenEndpoint = flag.String("listen", "unix:///tmp/cube/network-agent.sock", "network-agent listen endpoint")
-		healthListen   = flag.String("health-listen", "127.0.0.1:19090", "network-agent health server listen address")
-		grpcListen     = flag.String("grpc-listen", "unix:///tmp/cube/network-agent-grpc.sock", "optional gRPC listen endpoint, supports unix:// and tcp://")
-		cubeletConfig  = flag.String("cubelet-config", "", "optional Cubelet config.toml path used to sync network defaults")
-		ethName        = flag.String("eth-name", "", "node uplink interface name")
-		cidr           = flag.String("cidr", "192.168.0.0/18", "tap sandbox cidr")
-		mvmInnerIP     = flag.String("mvm-inner-ip", "169.254.68.6", "guest visible IP inside MVM")
-		mvmMacAddr     = flag.String("mvm-mac-addr", "20:90:6f:fc:fc:fc", "guest MAC address")
-		mvmGwDestIP    = flag.String("mvm-gw-dest-ip", "169.254.68.5", "guest gateway destination IP")
-		mvmGwMacAddr   = flag.String("mvm-gw-mac-addr", "20:90:6f:cf:cf:cf", "guest gateway MAC address")
-		mvmMask        = flag.Int("mvm-mask", 30, "guest mask bits")
-		mvmMTU         = flag.Int("mvm-mtu", defaultCfg.MvmMtu, "guest mtu")
-		stateDir       = flag.String("state-dir", defaultCfg.StateDir, "network-agent state directory")
-		tapFDListen    = flag.String("tap-fd-listen", "unix:///tmp/cube/network-agent-tap.sock", "unix socket for passing original tap fds to cubelet")
-		hostProxyBind  = flag.String("host-proxy-bind-ip", "127.0.0.1", "host proxy bind ip")
-		logPath        = flag.String("logpath", defaultLogDir, "network-agent log directory")
-		logLevel       = flag.String("log-level", defaultLogLevel, "set the logging level [debug, info, warn, error, fatal]")
-		logRollNum     = flag.Int("log-roll-num", defaultRollNum, "network-agent log files roll number")
-		logRollSize    = flag.Int("log-roll-size", defaultRollSizeMB, "network-agent log files roll size(MB)")
-		pprofListen    = flag.String("pprof-listen", "", "optional pprof/debug http listen address (e.g. 127.0.0.1:6060); empty disables profiling")
+		listenEndpoint   = flag.String("listen", "unix:///tmp/cube/network-agent.sock", "network-agent listen endpoint")
+		healthListen     = flag.String("health-listen", "127.0.0.1:19090", "network-agent health server listen address")
+		grpcListen       = flag.String("grpc-listen", "unix:///tmp/cube/network-agent-grpc.sock", "optional gRPC listen endpoint, supports unix:// and tcp://")
+		cubeletConfig    = flag.String("cubelet-config", "", "optional Cubelet config.toml path used to sync network defaults")
+		ethName          = flag.String("eth-name", "", "node uplink interface name")
+		cidr             = flag.String("cidr", "192.168.0.0/18", "tap sandbox cidr")
+		mvmInnerIP       = flag.String("mvm-inner-ip", "169.254.68.6", "guest visible IP inside MVM")
+		mvmMacAddr       = flag.String("mvm-mac-addr", "20:90:6f:fc:fc:fc", "guest MAC address")
+		mvmGwDestIP      = flag.String("mvm-gw-dest-ip", "169.254.68.5", "guest gateway destination IP")
+		mvmGwMacAddr     = flag.String("mvm-gw-mac-addr", "20:90:6f:cf:cf:cf", "guest gateway MAC address")
+		mvmMask          = flag.Int("mvm-mask", 30, "guest mask bits")
+		mvmMTU           = flag.Int("mvm-mtu", defaultCfg.MvmMtu, "guest mtu")
+		cubeRouterEnable = flag.Bool("cube-router-enable", defaultCfg.CubeRouterEnable, "enable cube-router route-aware egress")
+		cubeRouterCIDR   = flag.String("cube-router-cidr", defaultCfg.CubeRouterCIDR, "optional cube-router IPv4 CIDR; empty derives addresses from sandbox CIDR")
+		cubeRouterMAC    = flag.String("cube-router-mac-addr", defaultCfg.CubeRouterMacAddr, "cube-router MAC address")
+		stateDir         = flag.String("state-dir", defaultCfg.StateDir, "network-agent state directory")
+		tapFDListen      = flag.String("tap-fd-listen", "unix:///tmp/cube/network-agent-tap.sock", "unix socket for passing original tap fds to cubelet")
+		hostProxyBind    = flag.String("host-proxy-bind-ip", "127.0.0.1", "host proxy bind ip")
+		logPath          = flag.String("logpath", defaultLogDir, "network-agent log directory")
+		logLevel         = flag.String("log-level", defaultLogLevel, "set the logging level [debug, info, warn, error, fatal]")
+		logRollNum       = flag.Int("log-roll-num", defaultRollNum, "network-agent log files roll number")
+		logRollSize      = flag.Int("log-roll-size", defaultRollSizeMB, "network-agent log files roll size(MB)")
+		pprofListen      = flag.String("pprof-listen", "", "optional pprof/debug http listen address (e.g. 127.0.0.1:6060); empty disables profiling")
 	)
 	flag.Parse()
 	if showVersion {
@@ -105,6 +108,15 @@ func main() {
 	}
 	if overrides["mvm-mtu"] {
 		cfg.MvmMtu = *mvmMTU
+	}
+	if overrides["cube-router-enable"] {
+		cfg.CubeRouterEnable = *cubeRouterEnable
+	}
+	if overrides["cube-router-cidr"] {
+		cfg.CubeRouterCIDR = *cubeRouterCIDR
+	}
+	if overrides["cube-router-mac-addr"] {
+		cfg.CubeRouterMacAddr = *cubeRouterMAC
 	}
 	if overrides["state-dir"] {
 		cfg.StateDir = *stateDir
@@ -246,7 +258,7 @@ func validateService(svc service.Service) error {
 
 func summarizeConfig(cfg service.Config) string {
 	return fmt.Sprintf(
-		"eth_name=%q object_dir=%q cidr=%q mvm_inner_ip=%q mvm_mac_addr=%q mvm_gw_dest_ip=%q mvm_gw_mac_addr=%q mvm_mask=%d mvm_mtu=%d tap_init_num=%d state_dir=%q tap_fd_socket_path=%q host_proxy_bind_ip=%q connect_timeout=%s",
+		"eth_name=%q object_dir=%q cidr=%q mvm_inner_ip=%q mvm_mac_addr=%q mvm_gw_dest_ip=%q mvm_gw_mac_addr=%q mvm_mask=%d mvm_mtu=%d cube_router_enable=%v cube_router_cidr=%q cube_router_mac_addr=%q tap_init_num=%d state_dir=%q tap_fd_socket_path=%q host_proxy_bind_ip=%q connect_timeout=%s",
 		cfg.EthName,
 		cfg.ObjectDir,
 		cfg.CIDR,
@@ -256,6 +268,9 @@ func summarizeConfig(cfg service.Config) string {
 		cfg.MvmGwMacAddr,
 		cfg.MvmMask,
 		cfg.MvmMtu,
+		cfg.CubeRouterEnable,
+		cfg.CubeRouterCIDR,
+		cfg.CubeRouterMacAddr,
 		cfg.TapInitNum,
 		cfg.StateDir,
 		cfg.TapFDSocketPath,

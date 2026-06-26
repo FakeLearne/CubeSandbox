@@ -252,16 +252,18 @@ var (
 )
 
 type Config struct {
-	EthName      string `toml:"eth_name"`
-	TapInitNum   int    `toml:"tap_init_num"`
-	CIDR         string `toml:"cidr"`
-	ObjectDir    string `toml:"object_dir"`
-	MVMInnerIP   string `toml:"mvm_inner_ip"`
-	MVMMacAddr   string `toml:"mvm_mac_addr"`
-	MvmGwDestIP  string `toml:"mvm_gw_dest_ip"`
-	MvmGwMacAddr string `toml:"mvm_gw_mac_addr"`
-	MvmMask      int    `toml:"mvm_mask"`
-	MvmMtu       int    `toml:"mvm_mtu"`
+	EthName          string `toml:"eth_name"`
+	TapInitNum       int    `toml:"tap_init_num"`
+	CIDR             string `toml:"cidr"`
+	ObjectDir        string `toml:"object_dir"`
+	MVMInnerIP       string `toml:"mvm_inner_ip"`
+	MVMMacAddr       string `toml:"mvm_mac_addr"`
+	MvmGwDestIP      string `toml:"mvm_gw_dest_ip"`
+	MvmGwMacAddr     string `toml:"mvm_gw_mac_addr"`
+	MvmMask          int    `toml:"mvm_mask"`
+	MvmMtu           int    `toml:"mvm_mtu"`
+	CubeRouterEnable bool   `toml:"cube_router_enable"`
+	CubeRouterCIDR   string `toml:"cube_router_cidr"`
 
 	CheckIntervalTime      tomlext.Duration `toml:"check_interval_in_sec"`
 	ReportStatIntervalTime tomlext.Duration `toml:"report_stat_interval_in_sec"`
@@ -1315,7 +1317,7 @@ func getGwIPAndMask(cidr string) (net.IP, int, error) {
 		return nil, 0, fmt.Errorf("invalid IPv4 CIDR: %s", cidr)
 	}
 	mask := prefix.Bits()
-	if mask < 8 || mask > 30 {
+	if mask < 8 || mask > 29 {
 		return nil, 0, &net.ParseError{Type: "cidr mask fail", Text: cidr}
 	}
 	// Gateway is network address + 1

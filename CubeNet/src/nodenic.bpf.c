@@ -376,6 +376,8 @@ static int do_udp_nat(struct __sk_buff *skb)
 
 static int do_tcp_nat(struct __sk_buff *skb)
 {
+	struct session_key key = {};
+	struct nat_session *sess;
 	struct mvm_port *mvm_port;
 	struct ethhdr *l2;
 	struct iphdr *l3;
@@ -385,16 +387,37 @@ static int do_tcp_nat(struct __sk_buff *skb)
 	if (!__pull_headers(skb, &l2, &l3, &l4))
 		return TC_ACT_OK;
 
+	/* Session reverse NAT always takes precedence over port mapping. Keep the
+	 * existence check separate from tcp_nat_session(): a rewrite failure must
+	 * not fall through and be mistaken for a port-mapping packet.
+	 */
+	key.src_ip = l3->saddr;
+	key.dst_ip = l3->daddr;
+	key.src_port = l4->source;
+	key.dst_port = l4->dest;
+	key.version = 0;
+	key.protocol = l3->protocol;
+	sess = lookup_session(&key);
+	if (sess)
+		return tcp_nat_session(skb, l2, l3, l4);
+
+	/* Port mapping is exposed only on the configured primary NIC. The same
+	 * from_world program also runs on cube-router egress, where a session miss
+	 * must simply continue through the stack.
+	 */
+	if (skb->ifindex != nodenic_ifindex)
+		return TC_ACT_OK;
+
 	dport = l4->dest;
 	mvm_port = bpf_map_lookup_elem(&remote_port_mapping, &dport);
 	if (mvm_port)
 		return tcp_nat_proxy(skb, l2, l3, l4, mvm_port);
 
-	return tcp_nat_session(skb, l2, l3, l4);
+	return TC_ACT_OK;
 }
 
-/* This filter will be attached to the ingress path of host NIC.
- * It performs NAT and then redirect the traffics to Sandbox TAP devices.
+/* This filter is shared by the primary NIC ingress and cube-router egress.
+ * It performs reverse NAT and redirects matching traffic to Sandbox TAPs.
  */
 SEC("tc")
 int from_world(struct __sk_buff *skb)

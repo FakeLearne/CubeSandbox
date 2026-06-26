@@ -44,8 +44,8 @@ func TestNewIPAllocator(t *testing.T) {
 			wantErr: true,
 		},
 		{
-			name:    "mask-31-too-large",
-			cidr:    "192.168.0.0/31",
+			name:    "mask-30-too-large",
+			cidr:    "192.168.0.0/30",
 			wantErr: true,
 		},
 		{
@@ -55,11 +55,11 @@ func TestNewIPAllocator(t *testing.T) {
 			wantGw:  "192.168.1.1",
 		},
 		{
-			name:     "valid-30-reserves-three",
-			cidr:     "10.0.0.0/30",
+			name:     "valid-29-reserves-three",
+			cidr:     "10.0.0.0/29",
 			wantErr:  false,
 			wantGw:   "10.0.0.1",
-			wantUsed: 3, // network(.0) + gateway(.1) + broadcast(.3)
+			wantUsed: 3, // network(.0) + gateway(.1) + broadcast(.7)
 		},
 	}
 
@@ -126,22 +126,29 @@ func TestNewIPAllocatorStartIdxNormalization(t *testing.T) {
 }
 
 func TestIPAllocatorAllocateAndExhaustion(t *testing.T) {
-	// small subnet for exhaustion test: /30 gives 4 IPs (size=4)
-	// reserved: network (.0), gw (.1), broadcast (.3)
-	// usable: 1 IP (.2)
-	a, err := newIPAllocator("10.0.0.0/30")
+	// small subnet for exhaustion test: /29 gives 8 IPs (size=8)
+	// reserved: network (.0), gw (.1), broadcast (.7)
+	// usable: 5 IPs (.2-.6)
+	a, err := newIPAllocator("10.0.0.0/29")
 	if err != nil {
 		t.Fatal(err)
 	}
 
-	// allocate the only available IP
-	ip, err := a.Allocate()
-	if err != nil {
-		t.Fatalf("unexpected error allocating IP: %v", err)
+	expected := []net.IP{
+		net.ParseIP("10.0.0.2").To4(),
+		net.ParseIP("10.0.0.3").To4(),
+		net.ParseIP("10.0.0.4").To4(),
+		net.ParseIP("10.0.0.5").To4(),
+		net.ParseIP("10.0.0.6").To4(),
 	}
-	expected := net.ParseIP("10.0.0.2").To4()
-	if !ip.Equal(expected) {
-		t.Fatalf("Allocate()=%v, want %v", ip, expected)
+	for _, want := range expected {
+		ip, err := a.Allocate()
+		if err != nil {
+			t.Fatalf("unexpected error allocating IP: %v", err)
+		}
+		if !ip.Equal(want) {
+			t.Fatalf("Allocate()=%v, want %v", ip, want)
+		}
 	}
 
 	// pool should be exhausted now
@@ -151,13 +158,13 @@ func TestIPAllocatorAllocateAndExhaustion(t *testing.T) {
 	}
 
 	// release the IP and allocate again
-	a.Release(expected)
+	a.Release(expected[0])
 	ip2, err := a.Allocate()
 	if err != nil {
 		t.Fatalf("unexpected error after release: %v", err)
 	}
-	if !ip2.Equal(expected) {
-		t.Fatalf("Allocate() after release=%v, want %v", ip2, expected)
+	if !ip2.Equal(expected[0]) {
+		t.Fatalf("Allocate() after release=%v, want %v", ip2, expected[0])
 	}
 }
 

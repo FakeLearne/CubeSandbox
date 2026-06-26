@@ -19,20 +19,23 @@ const (
 
 // Config keeps the minimal single-node network-agent settings aligned with Cubelet.
 type Config struct {
-	EthName         string
-	ObjectDir       string
-	CIDR            string
-	MVMInnerIP      string
-	MVMMacAddr      string
-	MvmGwDestIP     string
-	MvmGwMacAddr    string
-	MvmMask         int
-	MvmMtu          int
-	TapInitNum      int
-	StateDir        string
-	TapFDSocketPath string
-	HostProxyBindIP string
-	ConnectTimeout  time.Duration
+	EthName           string
+	ObjectDir         string
+	CIDR              string
+	MVMInnerIP        string
+	MVMMacAddr        string
+	MvmGwDestIP       string
+	MvmGwMacAddr      string
+	MvmMask           int
+	MvmMtu            int
+	CubeRouterEnable  bool
+	CubeRouterCIDR    string
+	CubeRouterMacAddr string
+	TapInitNum        int
+	StateDir          string
+	TapFDSocketPath   string
+	HostProxyBindIP   string
+	ConnectTimeout    time.Duration
 
 	// CubeEgressAdminURL points at the colocated CubeEgress admin
 	// listener (loopback, e.g. http://127.0.0.1:9090). Defaults to
@@ -62,6 +65,9 @@ func DefaultConfig() Config {
 		MvmGwMacAddr:          "20:90:6f:cf:cf:cf",
 		MvmMask:               30,
 		MvmMtu:                1500,
+		CubeRouterEnable:      false,
+		CubeRouterCIDR:        "",
+		CubeRouterMacAddr:     "22:90:6f:cf:cf:cf",
 		TapInitNum:            0,
 		StateDir:              defaultStateDir,
 		TapFDSocketPath:       "/tmp/cube/network-agent-tap.sock",
@@ -87,6 +93,9 @@ type cubeletNetworkConfig struct {
 	MvmGwMacAddr          string `toml:"mvm_gw_mac_addr"`
 	MvmMask               int    `toml:"mvm_mask"`
 	MvmMtu                int    `toml:"mvm_mtu"`
+	CubeRouterEnable      bool   `toml:"cube_router_enable"`
+	CubeRouterCIDR        string `toml:"cube_router_cidr"`
+	CubeRouterMacAddr     string `toml:"cube_router_mac_addr"`
 	CubeEgressAdminURL    string `toml:"cube_egress_admin_url"`
 	CubeEgressPushTimeout string `toml:"cube_egress_push_timeout"`
 }
@@ -139,6 +148,13 @@ func LoadConfigFromCubeletTOML(base Config, path string) (Config, error) {
 	}
 	if networkCfg.MvmMtu != 0 {
 		base.MvmMtu = networkCfg.MvmMtu
+	}
+	base.CubeRouterEnable = networkCfg.CubeRouterEnable
+	if networkCfg.CubeRouterCIDR != "" {
+		base.CubeRouterCIDR = networkCfg.CubeRouterCIDR
+	}
+	if networkCfg.CubeRouterMacAddr != "" {
+		base.CubeRouterMacAddr = networkCfg.CubeRouterMacAddr
 	}
 	if networkCfg.TapInitNum != 0 {
 		base.TapInitNum = networkCfg.TapInitNum

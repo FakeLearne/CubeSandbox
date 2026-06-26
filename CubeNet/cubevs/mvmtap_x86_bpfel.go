@@ -199,20 +199,25 @@ type mvmtapMapSpecs struct {
 //
 // It can be passed ebpf.CollectionSpec.Assign.
 type mvmtapVariableSpecs struct {
-	Cubegw0Ifindex   *ebpf.VariableSpec `ebpf:"cubegw0_ifindex"`
-	Cubegw0Ip        *ebpf.VariableSpec `ebpf:"cubegw0_ip"`
-	Cubegw0MacaddrP1 *ebpf.VariableSpec `ebpf:"cubegw0_macaddr_p1"`
-	Cubegw0MacaddrP2 *ebpf.VariableSpec `ebpf:"cubegw0_macaddr_p2"`
-	MvmGatewayIp     *ebpf.VariableSpec `ebpf:"mvm_gateway_ip"`
-	MvmInnerIp       *ebpf.VariableSpec `ebpf:"mvm_inner_ip"`
-	MvmMacaddrP1     *ebpf.VariableSpec `ebpf:"mvm_macaddr_p1"`
-	MvmMacaddrP2     *ebpf.VariableSpec `ebpf:"mvm_macaddr_p2"`
-	NodegwMacaddrP1  *ebpf.VariableSpec `ebpf:"nodegw_macaddr_p1"`
-	NodegwMacaddrP2  *ebpf.VariableSpec `ebpf:"nodegw_macaddr_p2"`
-	NodenicIfindex   *ebpf.VariableSpec `ebpf:"nodenic_ifindex"`
-	NodenicIp        *ebpf.VariableSpec `ebpf:"nodenic_ip"`
-	NodenicMacaddrP1 *ebpf.VariableSpec `ebpf:"nodenic_macaddr_p1"`
-	NodenicMacaddrP2 *ebpf.VariableSpec `ebpf:"nodenic_macaddr_p2"`
+	Cubegw0Ifindex      *ebpf.VariableSpec `ebpf:"cubegw0_ifindex"`
+	Cubegw0Ip           *ebpf.VariableSpec `ebpf:"cubegw0_ip"`
+	Cubegw0MacaddrP1    *ebpf.VariableSpec `ebpf:"cubegw0_macaddr_p1"`
+	Cubegw0MacaddrP2    *ebpf.VariableSpec `ebpf:"cubegw0_macaddr_p2"`
+	EgressDmacaddrP1    *ebpf.VariableSpec `ebpf:"egress_dmacaddr_p1"`
+	EgressDmacaddrP2    *ebpf.VariableSpec `ebpf:"egress_dmacaddr_p2"`
+	EgressRedirectFlags *ebpf.VariableSpec `ebpf:"egress_redirect_flags"`
+	EgressSmacaddrP1    *ebpf.VariableSpec `ebpf:"egress_smacaddr_p1"`
+	EgressSmacaddrP2    *ebpf.VariableSpec `ebpf:"egress_smacaddr_p2"`
+	MvmGatewayIp        *ebpf.VariableSpec `ebpf:"mvm_gateway_ip"`
+	MvmInnerIp          *ebpf.VariableSpec `ebpf:"mvm_inner_ip"`
+	MvmMacaddrP1        *ebpf.VariableSpec `ebpf:"mvm_macaddr_p1"`
+	MvmMacaddrP2        *ebpf.VariableSpec `ebpf:"mvm_macaddr_p2"`
+	NodegwMacaddrP1     *ebpf.VariableSpec `ebpf:"nodegw_macaddr_p1"`
+	NodegwMacaddrP2     *ebpf.VariableSpec `ebpf:"nodegw_macaddr_p2"`
+	NodenicIfindex      *ebpf.VariableSpec `ebpf:"nodenic_ifindex"`
+	NodenicIp           *ebpf.VariableSpec `ebpf:"nodenic_ip"`
+	NodenicMacaddrP1    *ebpf.VariableSpec `ebpf:"nodenic_macaddr_p1"`
+	NodenicMacaddrP2    *ebpf.VariableSpec `ebpf:"nodenic_macaddr_p2"`
 }
 
 // mvmtapObjects contains all objects after they have been loaded into the kernel.
@@ -280,20 +285,25 @@ func (m *mvmtapMaps) Close() error {
 //
 // It can be passed to loadMvmtapObjects or ebpf.CollectionSpec.LoadAndAssign.
 type mvmtapVariables struct {
-	Cubegw0Ifindex   *ebpf.Variable `ebpf:"cubegw0_ifindex"`
-	Cubegw0Ip        *ebpf.Variable `ebpf:"cubegw0_ip"`
-	Cubegw0MacaddrP1 *ebpf.Variable `ebpf:"cubegw0_macaddr_p1"`
-	Cubegw0MacaddrP2 *ebpf.Variable `ebpf:"cubegw0_macaddr_p2"`
-	MvmGatewayIp     *ebpf.Variable `ebpf:"mvm_gateway_ip"`
-	MvmInnerIp       *ebpf.Variable `ebpf:"mvm_inner_ip"`
-	MvmMacaddrP1     *ebpf.Variable `ebpf:"mvm_macaddr_p1"`
-	MvmMacaddrP2     *ebpf.Variable `ebpf:"mvm_macaddr_p2"`
-	NodegwMacaddrP1  *ebpf.Variable `ebpf:"nodegw_macaddr_p1"`
-	NodegwMacaddrP2  *ebpf.Variable `ebpf:"nodegw_macaddr_p2"`
-	NodenicIfindex   *ebpf.Variable `ebpf:"nodenic_ifindex"`
-	NodenicIp        *ebpf.Variable `ebpf:"nodenic_ip"`
-	NodenicMacaddrP1 *ebpf.Variable `ebpf:"nodenic_macaddr_p1"`
-	NodenicMacaddrP2 *ebpf.Variable `ebpf:"nodenic_macaddr_p2"`
+	Cubegw0Ifindex      *ebpf.Variable `ebpf:"cubegw0_ifindex"`
+	Cubegw0Ip           *ebpf.Variable `ebpf:"cubegw0_ip"`
+	Cubegw0MacaddrP1    *ebpf.Variable `ebpf:"cubegw0_macaddr_p1"`
+	Cubegw0MacaddrP2    *ebpf.Variable `ebpf:"cubegw0_macaddr_p2"`
+	EgressDmacaddrP1    *ebpf.Variable `ebpf:"egress_dmacaddr_p1"`
+	EgressDmacaddrP2    *ebpf.Variable `ebpf:"egress_dmacaddr_p2"`
+	EgressRedirectFlags *ebpf.Variable `ebpf:"egress_redirect_flags"`
+	EgressSmacaddrP1    *ebpf.Variable `ebpf:"egress_smacaddr_p1"`
+	EgressSmacaddrP2    *ebpf.Variable `ebpf:"egress_smacaddr_p2"`
+	MvmGatewayIp        *ebpf.Variable `ebpf:"mvm_gateway_ip"`
+	MvmInnerIp          *ebpf.Variable `ebpf:"mvm_inner_ip"`
+	MvmMacaddrP1        *ebpf.Variable `ebpf:"mvm_macaddr_p1"`
+	MvmMacaddrP2        *ebpf.Variable `ebpf:"mvm_macaddr_p2"`
+	NodegwMacaddrP1     *ebpf.Variable `ebpf:"nodegw_macaddr_p1"`
+	NodegwMacaddrP2     *ebpf.Variable `ebpf:"nodegw_macaddr_p2"`
+	NodenicIfindex      *ebpf.Variable `ebpf:"nodenic_ifindex"`
+	NodenicIp           *ebpf.Variable `ebpf:"nodenic_ip"`
+	NodenicMacaddrP1    *ebpf.Variable `ebpf:"nodenic_macaddr_p1"`
+	NodenicMacaddrP2    *ebpf.Variable `ebpf:"nodenic_macaddr_p2"`
 }
 
 // mvmtapPrograms contains all programs after they have been loaded into the kernel.
