@@ -90,20 +90,6 @@ func (a *ipAllocator) reserveIdx(idx int) {
 	a.reserved[idx] = struct{}{}
 }
 
-func (a *ipAllocator) ReserveIP(ip net.IP) {
-	a.Lock()
-	defer a.Unlock()
-	ipv4 := ip.To4()
-	if ipv4 == nil {
-		return
-	}
-	idx := a.ip2Idx(ipv4) - a.startIdx
-	if idx < 0 || idx >= a.size {
-		return
-	}
-	a.reserveIdx(idx)
-}
-
 func (a *ipAllocator) ReserveLastUsable(count int) {
 	a.Lock()
 	defer a.Unlock()
