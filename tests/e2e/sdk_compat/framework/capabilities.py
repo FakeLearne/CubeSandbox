@@ -12,6 +12,14 @@ PAUSE_RESUME = "pause_resume"
 NETWORK_ALLOW_DENY = "network_allow_deny"
 NETWORK_PUBLIC_ACCESS = "network_public_access"
 NETWORK_MASK_REQUEST_HOST = "network_mask_request_host"
+# CubeVS domain allow_out + DNS A learning (exact / leading "*.").
+NETWORK_DNS_ALLOW = "network_dns_allow"
+# Built-in deny of sandbox-private / link-local CIDRs when public egress is on.
+NETWORK_ALWAYS_DENIED = "network_always_denied"
+# CubeEgress L7 rules: inject, first-match, deny, TLS MITM, SNI/host.
+NETWORK_L7_EGRESS = "network_l7_egress"
+# Template CubeNetworkConfig merged with per-create network options.
+NETWORK_TEMPLATE_MERGE = "network_template_merge"
 PLATFORM_LIFECYCLE = "platform_lifecycle"
 HOST_MOUNT = "host_mount"
 VOLUME_PLUGIN = "volume_plugin"
@@ -38,6 +46,10 @@ CUBESANDBOX_CAPABILITIES = frozenset(
         NETWORK_ALLOW_DENY,
         NETWORK_PUBLIC_ACCESS,
         NETWORK_MASK_REQUEST_HOST,
+        NETWORK_DNS_ALLOW,
+        NETWORK_ALWAYS_DENIED,
+        NETWORK_L7_EGRESS,
+        NETWORK_TEMPLATE_MERGE,
         PLATFORM_LIFECYCLE,
         HOST_MOUNT,
         VOLUME_PLUGIN,
