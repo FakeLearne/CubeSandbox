@@ -214,7 +214,6 @@ func newProductionControllerDeps(cfg Config) (networkControllerDeps, error) {
 	if err != nil {
 		return networkControllerDeps{}, err
 	}
-	startCubeVSSessionLogDrain()
 	return networkControllerDeps{
 		store:             store,
 		allocator:         allocator,
@@ -387,6 +386,12 @@ func (s *NetworkController) startControllerRuntime() error {
 	if err := s.recover(); err != nil {
 		return err
 	}
+	// Stale HashOfMaps cleanup is part of startup reconciliation. Complete it
+	// before starting the reaper, background pool creation, or returning the
+	// controller to request-serving code so it cannot race a new TAP lifecycle.
+	s.runStaleNetPolicyMapGC()
+	startCubeVSSessionLogDrain()
+
 	// Pool warmup runs in the background so first-deploy startup
 	// (~63ms × TapInitNum) does not block NewNetworkController and trip
 	// systemd's ExecStartPost timeout. EnsureNetwork transparently

@@ -85,35 +85,15 @@ func ensureAllowOutV3InnerMap(outerMap *ebpf.Map, ifindex uint32) error {
 }
 
 func ensureDenyOutInnerMap(outerMap *ebpf.Map, ifindex uint32) error {
-	return ensureInnerMapWithFactory(outerMap, ifindex, MapNameDenyOut, newInnerLPMMap)
+	_, err := acquireInnerMap(outerMap, ifindex, MapNameDenyOut, newInnerLPMMap)
+	return err
 }
 
 func ensureInnerMapWithFactory(outerMap *ebpf.Map, ifindex uint32, mapName string,
 	newInner func() (*ebpf.Map, error),
 ) error {
-	// Check if inner map already exists for this ifindex.
-	var innerMapID uint32
-	err := outerMap.Lookup(&ifindex, &innerMapID)
-	if err == nil {
-		// Already present, nothing to do.
-		return nil
-	}
-	if !errors.Is(err, ebpf.ErrKeyNotExist) {
-		return fmt.Errorf("map.Lookup failed: %w, name: %s", err, mapName)
-	}
-
-	// Create a new inner LPM trie map and insert it.
-	inner, err := newInner()
-	if err != nil {
-		return err
-	}
-	defer inner.Close()
-
-	err = outerMap.Put(&ifindex, inner)
-	if err != nil {
-		return fmt.Errorf("map.Put failed: %w, name: %s", err, mapName)
-	}
-	return nil
+	_, err := acquireInnerMap(outerMap, ifindex, mapName, newInner)
+	return err
 }
 
 // initNetPolicy creates inner LPM trie maps for the given ifindex
@@ -148,53 +128,51 @@ func initNetPolicy(ifindex uint32) error {
 // flushInnerMap removes all entries from the inner LPM trie map
 // associated with the given ifindex in the outer hash-of-maps.
 func flushInnerMap(outerMap *ebpf.Map, ifindex uint32) error {
-	return flushInnerMapWithValue(outerMap, ifindex, new(lpmKey), new(uint32))
+	return flushInnerMapWithValue[lpmKey, uint32](outerMap, ifindex, MapNameDenyOut)
 }
 
 func flushAllowOutInnerMap(outerMap *ebpf.Map, ifindex uint32) error {
-	return flushInnerMapWithValue(outerMap, ifindex, new(lpmKeyV3), new(netPolicyValueV3))
+	return flushInnerMapWithValue[lpmKeyV3, netPolicyValueV3](outerMap, ifindex, MapNameAllowOutV3)
 }
 
-func flushInnerMapWithValue(outerMap *ebpf.Map, ifindex uint32, key, value any) error {
-	var innerMapID uint32
-	err := outerMap.Lookup(&ifindex, &innerMapID)
+func flushInnerMapWithValue[K any, V any](outerMap *ebpf.Map, ifindex uint32, mapName string) error {
+	inner, err := acquireInnerMap(outerMap, ifindex, mapName, nil)
 	if err != nil {
 		if errors.Is(err, ebpf.ErrKeyNotExist) {
 			return nil
 		}
-		return fmt.Errorf("map.Lookup failed: %w", err)
+		return err
 	}
+	return flushInnerEntries[K, V](inner)
+}
 
-	inner, err := ebpf.NewMapFromID(ebpf.MapID(innerMapID))
-	if err != nil {
-		return fmt.Errorf("ebpf.NewMapFromID failed: %w, id: %d", err, innerMapID)
-	}
-	defer inner.Close()
-
+func flushInnerEntries[K any, V any](inner *ebpf.Map) error {
+	// cilium/ebpf iterators (especially LPM trie) can skip remaining
+	// entries if a key is deleted during Iterate. Collect first, then
+	// delete: Next overwrites the same key buffer, so append copies K.
+	var (
+		key   K
+		value V
+		keys  []K
+	)
 	iter := inner.Iterate()
-	for iter.Next(key, value) {
-		if err := inner.Delete(key); err != nil && !errors.Is(err, ebpf.ErrKeyNotExist) {
-			return fmt.Errorf("inner map delete failed: %w", err)
-		}
+	for iter.Next(&key, &value) {
+		keys = append(keys, key)
 	}
 	if err := iter.Err(); err != nil {
 		return fmt.Errorf("inner map iterate failed: %w", err)
 	}
+	for i := range keys {
+		if err := inner.Delete(&keys[i]); err != nil && !errors.Is(err, ebpf.ErrKeyNotExist) {
+			return fmt.Errorf("inner map delete failed: %w", err)
+		}
+	}
 	return nil
 }
 
-func lookupInnerMap(outerMap *ebpf.Map, ifindex uint32) (*ebpf.Map, error) {
-	var innerMapID uint32
-	err := outerMap.Lookup(&ifindex, &innerMapID)
-	if err != nil {
-		return nil, fmt.Errorf("map.Lookup failed: %w", err)
-	}
-
-	inner, err := ebpf.NewMapFromID(ebpf.MapID(innerMapID))
-	if err != nil {
-		return nil, fmt.Errorf("ebpf.NewMapFromID failed: %w, id: %d", err, innerMapID)
-	}
-	return inner, nil
+// lookupInnerMap returns a cached inner map FD. Callers must not Close it.
+func lookupInnerMap(outerMap *ebpf.Map, ifindex uint32, mapName string) (*ebpf.Map, error) {
+	return acquireInnerMap(outerMap, ifindex, mapName, nil)
 }
 
 // cleanupNetPolicy flushes all entries in the inner LPM trie maps
@@ -224,6 +202,10 @@ func cleanupNetPolicy(ifindex uint32) error {
 // CleanupTAPDevicePolicy removes sandbox-specific CubeVS policy residue for one
 // TAP ifindex. It does not install reusable-pool defaults and does not touch TAP
 // metadata; callers compose those steps explicitly.
+//
+// Ready-pool reuse must keep the HashOfMaps outer keys (and reinstall default
+// deny afterwards). Outer keys are deleted only when the TAP netdev itself is
+// destroyed — see DeleteTAPDevicePolicyMaps and GCStaleNetPolicyMaps.
 func CleanupTAPDevicePolicy(ifindex uint32) error {
 	if err := cleanupNetPolicy(ifindex); err != nil {
 		return err
@@ -232,6 +214,106 @@ func CleanupTAPDevicePolicy(ifindex uint32) error {
 		return err
 	}
 	return cleanupDNSPolicyFlags(ifindex)
+}
+
+var netPolicyOuterMaps = []string{
+	MapNameAllowOutV3,
+	MapNameDenyOut,
+	MapNameDNSAllowV2,
+}
+
+// DeleteTAPDevicePolicyMaps removes HashOfMaps outer entries for a destroyed TAP.
+// Call this only after the host netdev is gone; Ready-pool cleanup must not use it.
+func DeleteTAPDevicePolicyMaps(ifindex uint32) error {
+	var errs []error
+	for _, name := range netPolicyOuterMaps {
+		outer, err := loadPinnedMap(name)
+		if err != nil {
+			// Drop any cached FD even when the pinned outer is unavailable so a
+			// later reuse of this ifindex cannot see a stale userspace entry.
+			releaseCachedInner(name, ifindex)
+			errs = append(errs, err)
+			continue
+		}
+		if err := deleteCachedInnerAndOuter(outer, name, ifindex); err != nil {
+			errs = append(errs, fmt.Errorf("delete %s[%d]: %w", name, ifindex, err))
+		}
+		_ = outer.Close()
+	}
+	return errors.Join(errs...)
+}
+
+// GCStaleNetPolicyMaps deletes HashOfMaps outer keys whose ifindex is not in
+// keep. keep must include every live pool TAP (Ready, Cleaning, and Active), not
+// only Active sandboxes — Ready TAPs still need deny_out defaults.
+//
+// stillPresent is optional. When set, each candidate is re-checked immediately
+// before delete; if it returns true the key is kept.
+//
+// onConflict is optional. After a successful delete, stillPresent is checked
+// again; if the ifindex is now live, onConflict is invoked so the caller can
+// restore default-deny (create raced between the pre-delete check and Delete).
+func GCStaleNetPolicyMaps(keep map[uint32]struct{}, stillPresent func(uint32) bool, onConflict func(uint32)) (int, error) {
+	if keep == nil {
+		keep = map[uint32]struct{}{}
+	}
+	deleted := 0
+	conflicted := make(map[uint32]struct{})
+	var errs []error
+	for _, name := range netPolicyOuterMaps {
+		n, err := gcStaleOuterKeys(name, keep, stillPresent, conflicted)
+		deleted += n
+		if err != nil {
+			errs = append(errs, err)
+		}
+	}
+	if onConflict != nil {
+		for ifindex := range conflicted {
+			onConflict(ifindex)
+		}
+	}
+	return deleted, errors.Join(errs...)
+}
+
+func gcStaleOuterKeys(mapName string, keep map[uint32]struct{}, stillPresent func(uint32) bool, conflicted map[uint32]struct{}) (int, error) {
+	outer, err := loadPinnedMap(mapName)
+	if err != nil {
+		return 0, err
+	}
+	defer outer.Close()
+
+	var (
+		ifindex uint32
+		value   uint32
+		stale   []uint32
+	)
+	iter := outer.Iterate()
+	for iter.Next(&ifindex, &value) {
+		if _, ok := keep[ifindex]; !ok {
+			stale = append(stale, ifindex)
+		}
+	}
+	if err := iter.Err(); err != nil {
+		return 0, fmt.Errorf("iterate %s failed: %w", mapName, err)
+	}
+
+	deleted := 0
+	var errs []error
+	for _, ifindex := range stale {
+		if stillPresent != nil && stillPresent(ifindex) {
+			continue
+		}
+		if err := deleteCachedInnerAndOuter(outer, mapName, ifindex); err != nil {
+			errs = append(errs, fmt.Errorf("delete stale %s[%d]: %w", mapName, ifindex, err))
+			continue
+		}
+		deleted++
+		// Create may have raced in after the pre-delete stillPresent check.
+		if stillPresent != nil && stillPresent(ifindex) {
+			conflicted[ifindex] = struct{}{}
+		}
+	}
+	return deleted, errors.Join(errs...)
 }
 
 func cleanupDNSPolicyFlags(ifindex uint32) error {
@@ -268,10 +350,11 @@ func InstallTAPDefaultDenyPolicy(ifindex uint32) error {
 	}
 	defer denyOut.Close()
 
-	if err := ensureDenyOutInnerMap(denyOut, ifindex); err != nil {
+	inner, err := acquireInnerMap(denyOut, ifindex, MapNameDenyOut, newInnerLPMMap)
+	if err != nil {
 		return err
 	}
-	if err := populateInnerMap(denyOut, ifindex, alwaysDeniedSandboxEntries); err != nil {
+	if err := populateDenyOutInner(inner, alwaysDeniedSandboxEntries); err != nil {
 		return fmt.Errorf("populate default %s failed: %w", MapNameDenyOut, err)
 	}
 	return nil
@@ -993,25 +1076,10 @@ func isValidDNSDomainName(domain string) bool {
 	return true
 }
 
-// populateInnerMap inserts pre-parsed deny_out entries into the inner LPM trie
-// map for the specified ifindex.
-func populateInnerMap(outerMap *ebpf.Map, ifindex uint32, entries []denyOutPolicyEntry) error {
-	var innerMapID uint32
-	err := outerMap.Lookup(&ifindex, &innerMapID)
-	if err != nil {
-		return fmt.Errorf("map.Lookup failed: %w", err)
-	}
-
-	inner, err := ebpf.NewMapFromID(ebpf.MapID(innerMapID))
-	if err != nil {
-		return fmt.Errorf("ebpf.NewMapFromID failed: %w, id: %d", err, innerMapID)
-	}
-	defer inner.Close()
-
+func populateDenyOutInner(inner *ebpf.Map, entries []denyOutPolicyEntry) error {
 	val := uint32(netPolicyValueStatic)
 	for _, entry := range entries {
-		err = inner.Update(&entry.key, &val, ebpf.UpdateAny)
-		if err != nil {
+		if err := inner.Update(&entry.key, &val, ebpf.UpdateAny); err != nil {
 			return fmt.Errorf("inner map update failed: %w, cidr: %s", err, entry.source)
 		}
 	}
@@ -1031,18 +1099,14 @@ func populateInnerMap(outerMap *ebpf.Map, ifindex uint32, entries []denyOutPolic
 // silently drop the static verdict; a later DNS refresh preserves the
 // static zero expiry (dns_response.h same-key rule).
 func populateAllowOutInnerMap(outerMap *ebpf.Map, ifindex uint32, entries []allowOutPolicyEntry) error {
-	var innerMapID uint32
-	err := outerMap.Lookup(&ifindex, &innerMapID)
+	inner, err := acquireInnerMap(outerMap, ifindex, MapNameAllowOutV3, nil)
 	if err != nil {
-		return fmt.Errorf("map.Lookup failed: %w", err)
+		return err
 	}
+	return populateAllowOutInner(inner, entries)
+}
 
-	inner, err := ebpf.NewMapFromID(ebpf.MapID(innerMapID))
-	if err != nil {
-		return fmt.Errorf("ebpf.NewMapFromID failed: %w, id: %d", err, innerMapID)
-	}
-	defer inner.Close()
-
+func populateAllowOutInner(inner *ebpf.Map, entries []allowOutPolicyEntry) error {
 	for _, entry := range entries {
 		if entry.flags&netPolicyFlagL7Required != 0 {
 			ports := entry.ports
@@ -1145,16 +1209,16 @@ func applyNetPolicyWithMode(ifindex uint32, opts MVMOptions, replace bool) error
 		}
 		defer allowOutMap.Close()
 
-		if err := ensureAllowOutV3InnerMap(allowOutMap, ifindex); err != nil {
+		inner, err := acquireInnerMap(allowOutMap, ifindex, MapNameAllowOutV3, newInnerAllowOutMap)
+		if err != nil {
 			return err
 		}
 		if replace {
-			if err := flushAllowOutInnerMap(allowOutMap, ifindex); err != nil {
+			if err := flushInnerEntries[lpmKeyV3, netPolicyValueV3](inner); err != nil {
 				return fmt.Errorf("flush %s failed: %w", MapNameAllowOutV3, err)
 			}
 		}
-		err = populateAllowOutInnerMap(allowOutMap, ifindex, plan.allowOutEntries)
-		if err != nil {
+		if err := populateAllowOutInner(inner, plan.allowOutEntries); err != nil {
 			return fmt.Errorf("populate %s failed: %w", MapNameAllowOutV3, err)
 		}
 	}
@@ -1173,16 +1237,16 @@ func applyNetPolicyWithMode(ifindex uint32, opts MVMOptions, replace bool) error
 		}
 		defer denyOutMap.Close()
 
-		if err := ensureDenyOutInnerMap(denyOutMap, ifindex); err != nil {
+		inner, err := acquireInnerMap(denyOutMap, ifindex, MapNameDenyOut, newInnerLPMMap)
+		if err != nil {
 			return err
 		}
 		if replace {
-			if err := flushInnerMap(denyOutMap, ifindex); err != nil {
+			if err := flushInnerEntries[lpmKey, uint32](inner); err != nil {
 				return fmt.Errorf("flush %s failed: %w", MapNameDenyOut, err)
 			}
 		}
-		err = populateInnerMap(denyOutMap, ifindex, denyOutEntries)
-		if err != nil {
+		if err := populateDenyOutInner(inner, denyOutEntries); err != nil {
 			return fmt.Errorf("populate %s failed: %w", MapNameDenyOut, err)
 		}
 	}

@@ -123,15 +123,13 @@ func populateDNSAllowInnerMap(inner *ebpf.Map, rules []dnsAllowRule) error {
 }
 
 func flushDNSAllowForIfindex(outerMap *ebpf.Map, ifindex uint32) error {
-	inner, err := lookupInnerMap(outerMap, ifindex)
+	inner, err := lookupInnerMap(outerMap, ifindex, MapNameDNSAllowV2)
 	if errors.Is(err, ebpf.ErrKeyNotExist) {
 		return nil
 	}
 	if err != nil {
 		return err
 	}
-	defer inner.Close()
-
 	return flushDNSAllowInnerMap(inner)
 }
 
@@ -177,18 +175,7 @@ func mergePortsIntoDNSValue(v *dnsAllowValue, src []l7PortEntry) {
 }
 
 func flushDNSAllowInnerMap(inner *ebpf.Map) error {
-	var oldKey dnsAllowKey
-	var oldValue dnsAllowValue
-	iter := inner.Iterate()
-	for iter.Next(&oldKey, &oldValue) {
-		if err := inner.Delete(&oldKey); err != nil && !errors.Is(err, ebpf.ErrKeyNotExist) {
-			return fmt.Errorf("dns allow delete failed: %w", err)
-		}
-	}
-	if err := iter.Err(); err != nil {
-		return fmt.Errorf("dns allow iterate failed: %w", err)
-	}
-	return nil
+	return flushInnerEntries[dnsAllowKey, dnsAllowValue](inner)
 }
 
 // cleanupDNSAllow clears the sandbox DNS allow inner map while keeping it preallocated.
@@ -199,15 +186,13 @@ func cleanupDNSAllow(ifindex uint32) error {
 	}
 	defer dnsAllow.Close()
 
-	inner, err := lookupInnerMap(dnsAllow, ifindex)
+	inner, err := lookupInnerMap(dnsAllow, ifindex, MapNameDNSAllowV2)
 	if err != nil {
 		if errors.Is(err, ebpf.ErrKeyNotExist) {
 			return nil
 		}
 		return err
 	}
-	defer inner.Close()
-
 	return flushDNSAllowInnerMap(inner)
 }
 
@@ -226,16 +211,11 @@ func applyDNSAllow(ifindex uint32, rules []dnsAllowRule, replace bool) error {
 	if len(rules) == 0 {
 		return flushDNSAllowForIfindex(dnsAllow, ifindex)
 	}
-	if err := ensureDNSAllowInnerMap(dnsAllow, ifindex); err != nil {
-		return err
-	}
 
-	inner, err := lookupInnerMap(dnsAllow, ifindex)
+	inner, err := acquireInnerMap(dnsAllow, ifindex, MapNameDNSAllowV2, newInnerDNSAllowMap)
 	if err != nil {
 		return err
 	}
-	defer inner.Close()
-
 	if replace {
 		if err := flushDNSAllowInnerMap(inner); err != nil {
 			return err

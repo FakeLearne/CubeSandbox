@@ -127,11 +127,10 @@ func TestMigrateDNSAllowInnerMapFromLegacy(t *testing.T) {
 		t.Fatalf("migrateDNSAllowInnerMap: %v", err)
 	}
 
-	dest, err := lookupInnerMap(current, ifindex)
+	dest, err := lookupInnerMap(current, ifindex, MapNameDNSAllowV2)
 	if err != nil {
 		t.Fatalf("lookupInnerMap: %v", err)
 	}
-	defer dest.Close()
 
 	for _, e := range entries {
 		key, want, err := makeDNSAllowRule(e.domain, e.flags)
@@ -175,11 +174,10 @@ func TestMigrateDNSAllowInnerMapFromCurrent(t *testing.T) {
 		t.Fatalf("migrateDNSAllowInnerMap: %v", err)
 	}
 
-	dest, err := lookupInnerMap(current, ifindex)
+	dest, err := lookupInnerMap(current, ifindex, MapNameDNSAllowV2)
 	if err != nil {
 		t.Fatalf("lookupInnerMap: %v", err)
 	}
-	defer dest.Close()
 
 	var got dnsAllowValue
 	if err := dest.Lookup(&key, &got); err != nil {
@@ -311,11 +309,10 @@ func TestMigrateDNSAllowMapOuterWithBpffs(t *testing.T) {
 	}
 
 	// The new outer must now hold the migrated rules (NameLen+Flags, PortCount=0).
-	dest, err := lookupInnerMap(newOuter, ifindex)
+	dest, err := lookupInnerMap(newOuter, ifindex, MapNameDNSAllowV2)
 	if err != nil {
 		t.Fatalf("lookupInnerMap: %v", err)
 	}
-	defer dest.Close()
 	for _, e := range entries {
 		key, want, err := makeDNSAllowRule(e.domain, e.flags)
 		if err != nil {
@@ -581,11 +578,10 @@ func TestMigrateAllowOutMapOuterWithBpffs(t *testing.T) {
 		t.Fatalf("migrateAllowOutMap: %v", err)
 	}
 
-	dest, err := lookupInnerMap(newOuter, ifindex)
+	dest, err := lookupInnerMap(newOuter, ifindex, MapNameAllowOutV3)
 	if err != nil {
 		t.Fatalf("lookupInnerMap: %v", err)
 	}
-	defer dest.Close()
 
 	// The L7 entry expands to the default {80/http, 443/https} /48 set.
 	for _, tc := range []struct {

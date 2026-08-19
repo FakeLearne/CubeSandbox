@@ -219,11 +219,10 @@ func migrateAllowOutInnerMap(current *ebpf.Map, ifindex uint32, sourceName strin
 	if err := ensureAllowOutV3InnerMap(current, ifindex); err != nil {
 		return err
 	}
-	destination, err := lookupInnerMap(current, ifindex)
+	destination, err := lookupInnerMap(current, ifindex, MapNameAllowOutV3)
 	if err != nil {
 		return err
 	}
-	defer destination.Close()
 
 	switch info.ValueSize {
 	case legacyAllowOutValueSize:
@@ -310,11 +309,10 @@ func migrateDNSAllowInnerMap(current *ebpf.Map, ifindex uint32, sourceName strin
 	if err := ensureDNSAllowInnerMap(current, ifindex); err != nil {
 		return err
 	}
-	destination, err := lookupInnerMap(current, ifindex)
+	destination, err := lookupInnerMap(current, ifindex, MapNameDNSAllowV2)
 	if err != nil {
 		return err
 	}
-	defer destination.Close()
 
 	if info.ValueSize == legacySize {
 		var key dnsAllowKey

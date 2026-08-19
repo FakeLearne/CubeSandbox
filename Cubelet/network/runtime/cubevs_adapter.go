@@ -26,6 +26,7 @@ type CubeVSAdapter interface {
 	DeleteTAPDeviceMetadata(ifindex uint32, ip net.IP) error
 	AttachFilter(ifindex uint32) error
 	InstallTAPDefaultDenyPolicy(ifindex uint32) error
+	GCStaleNetPolicyMaps(keep map[uint32]struct{}, stillPresent func(uint32) bool, onConflict func(uint32)) (int, error)
 	AddPortMapping(ifindex uint32, containerPort, hostPort uint16) error
 	DelPortMapping(ifindex uint32, containerPort, hostPort uint16) error
 	DeletePortMappingsByIfindex(ifindex uint32) error
@@ -69,6 +70,10 @@ func (realCubeVSAdapter) AttachFilter(ifindex uint32) error {
 
 func (realCubeVSAdapter) InstallTAPDefaultDenyPolicy(ifindex uint32) error {
 	return cubevs.InstallTAPDefaultDenyPolicy(ifindex)
+}
+
+func (realCubeVSAdapter) GCStaleNetPolicyMaps(keep map[uint32]struct{}, stillPresent func(uint32) bool, onConflict func(uint32)) (int, error) {
+	return cubevs.GCStaleNetPolicyMaps(keep, stillPresent, onConflict)
 }
 
 func (realCubeVSAdapter) AddPortMapping(ifindex uint32, containerPort, hostPort uint16) error {
