@@ -196,6 +196,7 @@ var businessMapDumpOrder = []string{
 	MapNameLocalPortMapping,
 	MapNameEgressSessions,
 	MapNameIngressSessions,
+	MapNameOriginalSessions,
 	mapNameSNATIPList,
 	MapNameAllowOutV3,
 	MapNameDenyOut,
@@ -212,6 +213,7 @@ var businessMapDumpers = map[string]businessMapDumper{
 	MapNameLocalPortMapping:     dumpLocalPortMapping,
 	MapNameEgressSessions:       dumpEgressSessions,
 	MapNameIngressSessions:      dumpIngressSessions,
+	MapNameOriginalSessions:     dumpOriginalSessions,
 	mapNameSNATIPList:           dumpSNATIPList,
 	MapNameAllowOutV3:           dumpAllowOutV3,
 	MapNameDenyOut:              dumpDenyOut,
@@ -447,6 +449,48 @@ func dumpEgressSessions(opts DumpOptions, now uint64) (any, error) {
 		})
 	}
 	return entries, wrapIterErr(iter.Err(), MapNameEgressSessions)
+}
+
+func dumpOriginalSessions(opts DumpOptions, now uint64) (any, error) {
+	m, err := loadPinnedMap(MapNameOriginalSessions)
+	if err != nil {
+		return nil, err
+	}
+	defer m.Close()
+
+	entries := make([]EgressSessionDump, 0)
+	var key sessionKey
+	var value session
+	iter := m.Iterate()
+	for iter.Next(&key, &value) {
+		if !ifindexMatches(opts, value.VMIfindex) {
+			continue
+		}
+		expiresAt := value.AccessTime + value.tcpTimeout()
+		entries = append(entries, EgressSessionDump{
+			Key:            dumpSessionKey(key),
+			AccessTimeNS:   value.AccessTime,
+			ExpiresAtNS:    expiresAt,
+			ExpiresInNS:    remainingNS(expiresAt, now),
+			ExpiresIn:      remainingDuration(expiresAt, now),
+			Expired:        expiresAt <= now,
+			NodeIfindex:    value.NodeIfindex,
+			NodeIP:         uint32ToIP(value.NodeIP).String(),
+			VMIfindex:      value.VMIfindex,
+			VMIP:           uint32ToIP(value.VMIP).String(),
+			NodePort:       ntohs(value.NodePort),
+			VMPort:         ntohs(value.VMPort),
+			State:          sessionStateString(key.Protocol, value.State),
+			StateRaw:       value.State,
+			ActiveClose:    value.ActiveClose != 0,
+			ActiveCloseRaw: value.ActiveClose,
+			PacketClass:    "cubeproxy",
+			PacketClassRaw: value.PacketClass,
+			L7Scheme:       l7SchemeToString(value.L7Scheme),
+			L7SchemeRaw:    value.L7Scheme,
+		})
+	}
+	return entries, wrapIterErr(iter.Err(), MapNameOriginalSessions)
 }
 
 func dumpIngressSessions(opts DumpOptions, _ uint64) (any, error) {

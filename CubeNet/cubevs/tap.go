@@ -31,6 +31,11 @@ type tapMetadataMapOps interface {
 	Delete(key interface{}) error
 }
 
+type tapMetadataVersionMapOps interface {
+	Lookup(key, valueOut interface{}) error
+	Update(key, value interface{}, flags ebpf.MapUpdateFlags) error
+}
+
 // ListTAPDevices lists all TAP devices that managed by CubeVS.
 func ListTAPDevices() ([]TAPDevice, error) {
 	m, err := loadPinnedMap(MapNameIfindexToMVMMetadata)
@@ -68,6 +73,38 @@ func AddTAPDevice(ifindex uint32, ip net.IP, id string, version uint32, opts MVM
 		return err
 	}
 	return nil
+}
+
+// BumpTAPDeviceVersion advances the connection generation for an existing TAP.
+// Existing session keys become unreachable immediately because their version no
+// longer matches the metadata used by the datapath.
+func BumpTAPDeviceVersion(ifindex uint32) (oldVersion, newVersion uint32, err error) {
+	m, err := loadPinnedMap(MapNameIfindexToMVMMetadata)
+	if err != nil {
+		return 0, 0, err
+	}
+	defer m.Close()
+
+	return bumpTAPDeviceVersion(m, ifindex)
+}
+
+func bumpTAPDeviceVersion(m tapMetadataVersionMapOps, ifindex uint32) (oldVersion, newVersion uint32, err error) {
+	var meta mvmMetadata
+	if err := m.Lookup(&ifindex, &meta); err != nil {
+		return 0, 0, fmt.Errorf("map.Lookup failed: %w, name: %s", err, MapNameIfindexToMVMMetadata)
+	}
+
+	oldVersion = meta.Version
+	newVersion = oldVersion + 1
+	if newVersion == 0 {
+		newVersion = 1
+	}
+	meta.Version = newVersion
+
+	if err := m.Update(&ifindex, &meta, ebpf.UpdateExist); err != nil {
+		return oldVersion, 0, fmt.Errorf("map.Update failed: %w, name: %s", err, MapNameIfindexToMVMMetadata)
+	}
+	return oldVersion, newVersion, nil
 }
 
 // UpsertTAPDeviceMetadata registers or refreshes TAP metadata without touching

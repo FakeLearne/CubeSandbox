@@ -13,6 +13,30 @@ type fakeTapMetadataMap struct {
 	deleteErr error
 }
 
+type fakeTapVersionMap struct {
+	meta      mvmMetadata
+	lookupErr error
+	updateErr error
+	flags     ebpf.MapUpdateFlags
+}
+
+func (m *fakeTapVersionMap) Lookup(_ interface{}, valueOut interface{}) error {
+	if m.lookupErr != nil {
+		return m.lookupErr
+	}
+	*valueOut.(*mvmMetadata) = m.meta
+	return nil
+}
+
+func (m *fakeTapVersionMap) Update(_, value interface{}, flags ebpf.MapUpdateFlags) error {
+	if m.updateErr != nil {
+		return m.updateErr
+	}
+	m.meta = *value.(*mvmMetadata)
+	m.flags = flags
+	return nil
+}
+
 func (m *fakeTapMetadataMap) Lookup(key, valueOut interface{}) error {
 	if m.lookupErr != nil {
 		return m.lookupErr
@@ -107,5 +131,54 @@ func TestDeleteTAPDeviceMetadataEntriesLookupErrorDoesNotPartiallyDelete(t *test
 	}
 	if _, ok := ifindexMap.entries[ifindex]; !ok {
 		t.Fatal("ifindex metadata was deleted after reverse lookup failed")
+	}
+}
+
+func TestBumpTAPDeviceVersionPreservesMetadata(t *testing.T) {
+	m := &fakeTapVersionMap{meta: mvmMetadata{
+		IP:             0x01020304,
+		Version:        41,
+		UUID:           stringToByteArray("sandbox"),
+		DNSPolicyFlags: 3,
+		Reserved:       [55]uint8{1, 2, 3},
+	}}
+	before := m.meta
+
+	oldVersion, newVersion, err := bumpTAPDeviceVersion(m, 12)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if oldVersion != 41 || newVersion != 42 {
+		t.Fatalf("versions=(%d,%d), want (41,42)", oldVersion, newVersion)
+	}
+	if m.meta.Version != 42 {
+		t.Fatalf("stored version=%d, want 42", m.meta.Version)
+	}
+	before.Version = 42
+	if m.meta != before {
+		t.Fatalf("metadata changed beyond version: got=%#v want=%#v", m.meta, before)
+	}
+	if m.flags != ebpf.UpdateExist {
+		t.Fatalf("update flags=%v, want UpdateExist", m.flags)
+	}
+}
+
+func TestBumpTAPDeviceVersionSkipsZeroOnWrap(t *testing.T) {
+	m := &fakeTapVersionMap{meta: mvmMetadata{Version: ^uint32(0)}}
+	oldVersion, newVersion, err := bumpTAPDeviceVersion(m, 12)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if oldVersion != ^uint32(0) || newVersion != 1 || m.meta.Version != 1 {
+		t.Fatalf("versions=(%d,%d) stored=%d, want (%d,1,1)",
+			oldVersion, newVersion, m.meta.Version, ^uint32(0))
+	}
+}
+
+func TestBumpTAPDeviceVersionPropagatesLookupError(t *testing.T) {
+	lookupErr := errors.New("lookup failed")
+	_, _, err := bumpTAPDeviceVersion(&fakeTapVersionMap{lookupErr: lookupErr}, 12)
+	if !errors.Is(err, lookupErr) {
+		t.Fatalf("error=%v, want %v", err, lookupErr)
 	}
 }

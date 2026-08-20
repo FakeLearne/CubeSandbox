@@ -333,6 +333,7 @@ func (s *NetworkController) startMaintenanceLoop() {
 		ticker := time.NewTicker(maintenanceInterval)
 		defer ticker.Stop()
 		for range ticker.C {
+			s.retryPendingConnectionInvalidations()
 			s.handleCleaningEntries()
 		}
 	}()

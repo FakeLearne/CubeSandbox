@@ -22,6 +22,10 @@ type fakeCubeVSAdapter struct {
 	cleanupPolicyErr       error
 	deleteMetadataErr      error
 	deletePortMappingErr   error
+	bumpTAPDeviceErr       error
+	bumpTAPDeviceCalls     []uint32
+	bumpOldVersion         uint32
+	bumpNewVersion         uint32
 	recorder               *createOrderRecorder
 }
 
@@ -39,6 +43,19 @@ func (f *fakeCubeVSAdapter) UpsertTAPDevice(ifindex uint32, _ net.IP, _ string, 
 
 func (f *fakeCubeVSAdapter) UpsertTAPDeviceMetadata(_ uint32, _ net.IP, _ string, _ uint32) error {
 	return nil
+}
+
+func (f *fakeCubeVSAdapter) BumpTAPDeviceVersion(ifindex uint32) (uint32, uint32, error) {
+	f.bumpTAPDeviceCalls = append(f.bumpTAPDeviceCalls, ifindex)
+	if f.bumpTAPDeviceErr != nil {
+		return f.bumpOldVersion, 0, f.bumpTAPDeviceErr
+	}
+	oldVersion := f.bumpOldVersion
+	newVersion := f.bumpNewVersion
+	if newVersion == 0 {
+		newVersion = oldVersion + 1
+	}
+	return oldVersion, newVersion, nil
 }
 
 func (f *fakeCubeVSAdapter) GetTAPDevice(ifindex uint32) (*cubevs.TAPDevice, error) {

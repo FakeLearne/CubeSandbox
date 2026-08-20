@@ -21,6 +21,7 @@ type CubeVSAdapter interface {
 	AddTAPDevice(ifindex uint32, ip net.IP, sandboxID string, version uint32, opts cubevs.MVMOptions) error
 	UpsertTAPDevice(ifindex uint32, ip net.IP, sandboxID string, version uint32, opts cubevs.MVMOptions) error
 	UpsertTAPDeviceMetadata(ifindex uint32, ip net.IP, sandboxID string, version uint32) error
+	BumpTAPDeviceVersion(ifindex uint32) (oldVersion uint32, newVersion uint32, err error)
 	GetTAPDevice(ifindex uint32) (*cubevs.TAPDevice, error)
 	CleanupTAPPolicy(ifindex uint32) error
 	DeleteTAPDeviceMetadata(ifindex uint32, ip net.IP) error
@@ -50,6 +51,10 @@ func (realCubeVSAdapter) UpsertTAPDevice(ifindex uint32, ip net.IP, sandboxID st
 
 func (realCubeVSAdapter) UpsertTAPDeviceMetadata(ifindex uint32, ip net.IP, sandboxID string, version uint32) error {
 	return cubevs.UpsertTAPDeviceMetadata(ifindex, ip, sandboxID, version)
+}
+
+func (realCubeVSAdapter) BumpTAPDeviceVersion(ifindex uint32) (oldVersion uint32, newVersion uint32, err error) {
+	return cubevs.BumpTAPDeviceVersion(ifindex)
 }
 
 func (realCubeVSAdapter) GetTAPDevice(ifindex uint32) (*cubevs.TAPDevice, error) {

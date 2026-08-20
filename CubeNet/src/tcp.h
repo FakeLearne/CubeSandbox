@@ -5,7 +5,9 @@
 
 #include <vmlinux.h>
 #include "cubevs.h"
+#include "l2l3.h"
 #include "session.h"
+#include "skb.h"
 
 /* What TCP flags are set from RST/SYN/FIN/ACK. */
 enum tcp_bit_set {
@@ -266,8 +268,17 @@ static __always_inline long snat_tcp(struct __sk_buff *skb,
 	return 0;
 }
 
-static __always_inline void update_session(enum ip_conntrack_dir dir, struct nat_session *sess,
-					   __u64 now_ns, bool syn, bool ack, bool fin, bool rst)
+/* Shared TCP state transition core for the legacy nat_session value and the
+ * new single-table session value.  Keep the wrappers typed: casting map values
+ * between the two structs would hide future ABI drift from the compiler.
+ */
+static __always_inline void update_tcp_session_fields(enum ip_conntrack_dir dir,
+						       __u64 *access_time,
+						       __u8 *state,
+						       __u8 *active_close,
+						       __u64 now_ns,
+						       bool syn, bool ack,
+						       bool fin, bool rst)
 {
 	/* __u8 (not enum): keeps old_state in a single unsigned register. With a
 	 * signed enum, older clang (14) narrows the value with `&= 255` masks that
@@ -278,7 +289,8 @@ static __always_inline void update_session(enum ip_conntrack_dir dir, struct nat
 	__u8 old_state, new_state;
 	unsigned int index;
 
-	session_lazy_refresh(sess, now_ns);
+	if (now_ns - *access_time > SESSION_REFRESH_INTERVAL_NS)
+		*access_time = now_ns;
 
 	/* update CT state */
 	if (dir > IP_CT_DIR_REPLY) {
@@ -292,7 +304,7 @@ static __always_inline void update_session(enum ip_conntrack_dir dir, struct nat
 		return;
 	}
 
-	old_state = sess->state;
+	old_state = *state;
 	if (old_state > TCP_CONNTRACK_SYN_SENT2) {
 		/* TCP_CONNTRACK_SYN_SENT2 = TCP_CONNTRACK_LISTEN = 9
 		 * If we reach here, the state should be either
@@ -313,8 +325,8 @@ static __always_inline void update_session(enum ip_conntrack_dir dir, struct nat
 		 */
 		if ((old_state == TCP_CONNTRACK_FIN_WAIT ||
 		     old_state == TCP_CONNTRACK_CLOSE_WAIT) &&
-		    ((sess->active_close && dir == IP_CT_DIR_ORIGINAL) ||
-		     (!sess->active_close && dir == IP_CT_DIR_REPLY)))
+		    ((*active_close && dir == IP_CT_DIR_ORIGINAL) ||
+		     (!*active_close && dir == IP_CT_DIR_REPLY)))
 			new_state = old_state;
 
 		/* Record only a real original-direction transition that initiates
@@ -326,12 +338,219 @@ static __always_inline void update_session(enum ip_conntrack_dir dir, struct nat
 		if (dir == IP_CT_DIR_ORIGINAL &&
 		    new_state == TCP_CONNTRACK_FIN_WAIT &&
 		    new_state != old_state)
-			sess->active_close = 1;
+			*active_close = 1;
 	}
 
 	/* no store if state remain unchanged */
 	if (new_state != old_state)
-		sess->state = new_state;
+		*state = new_state;
+}
+
+static __always_inline void update_session(enum ip_conntrack_dir dir,
+					   struct nat_session *sess,
+					   __u64 now_ns, bool syn, bool ack,
+					   bool fin, bool rst)
+{
+	update_tcp_session_fields(dir, &sess->access_time, &sess->state,
+				  &sess->active_close, now_ns,
+				  syn, ack, fin, rst);
+}
+
+static __always_inline void update_original_session(enum ip_conntrack_dir dir,
+						    struct session *sess,
+						    __u64 now_ns, bool syn,
+						    bool ack, bool fin, bool rst)
+{
+	update_tcp_session_fields(dir, &sess->access_time, &sess->state,
+				  &sess->active_close, now_ns,
+				  syn, ack, fin, rst);
+}
+
+enum reset_dir {
+	RESET_TO_SANDBOX = 0,
+	RESET_TO_WORLD = 1,
+};
+
+static __always_inline bool tcp_segment_len(const struct iphdr *l3,
+					    const struct tcphdr *l4,
+					    __u32 *seg_len)
+{
+	__u16 ip_hlen, tcp_hlen, total_len;
+
+	ip_hlen = BPF_CORE_READ_BITFIELD(l3, ihl);
+	ip_hlen <<= 2;
+	tcp_hlen = BPF_CORE_READ_BITFIELD(l4, doff);
+	tcp_hlen <<= 2;
+	total_len = bpf_ntohs(l3->tot_len);
+	if (ip_hlen < sizeof(struct iphdr) || tcp_hlen < sizeof(struct tcphdr) ||
+	    total_len < ip_hlen + tcp_hlen)
+		return false;
+
+	*seg_len = total_len - ip_hlen - tcp_hlen;
+	if (l4->syn)
+		(*seg_len)++;
+	if (l4->fin)
+		(*seg_len)++;
+
+	return true;
+}
+
+static __always_inline int rewrite_l3_tot_len(struct __sk_buff *skb,
+					      __be16 old_tot_len,
+					      __be16 new_tot_len)
+{
+	long err;
+
+	err = bpf_l3_csum_replace(skb, IP_CSUM_OFF, old_tot_len, new_tot_len,
+				  sizeof(new_tot_len));
+	if (err)
+		return err;
+
+	return bpf_skb_store_bytes(skb, IP_TOT_LEN_OFF, &new_tot_len,
+				   sizeof(new_tot_len), 0);
+}
+
+static __always_inline int tcp_ipv4_set_checksum(struct __sk_buff *skb,
+						 __u32 tcp_csum_off,
+						 __be32 saddr, __be32 daddr,
+						 const struct tcphdr *tcp)
+{
+	const __u32 *words = (const __u32 *)tcp;
+	__be32 proto_len = bpf_htonl(((__u32)IPPROTO_TCP << 16) | sizeof(*tcp));
+	__u64 ph_flags = BPF_F_PSEUDO_HDR | sizeof(__u32);
+	__u64 hdr_flags = sizeof(__u32);
+	long err;
+
+	err = bpf_l4_csum_replace(skb, tcp_csum_off, 0, saddr, ph_flags);
+	if (err)
+		return err;
+	err = bpf_l4_csum_replace(skb, tcp_csum_off, 0, daddr, ph_flags);
+	if (err)
+		return err;
+	err = bpf_l4_csum_replace(skb, tcp_csum_off, 0, proto_len, ph_flags);
+	if (err)
+		return err;
+
+	err = bpf_l4_csum_replace(skb, tcp_csum_off, 0, words[0], hdr_flags);
+	if (err)
+		return err;
+	err = bpf_l4_csum_replace(skb, tcp_csum_off, 0, words[1], hdr_flags);
+	if (err)
+		return err;
+	err = bpf_l4_csum_replace(skb, tcp_csum_off, 0, words[2], hdr_flags);
+	if (err)
+		return err;
+	err = bpf_l4_csum_replace(skb, tcp_csum_off, 0, words[3], hdr_flags);
+	if (err)
+		return err;
+	return bpf_l4_csum_replace(skb, tcp_csum_off, 0, words[4], hdr_flags);
+}
+
+/* Turn the offending segment into an RFC 793 reset and send it back to the
+ * selected side.  Any construction failure degrades to a plain drop.
+ */
+static __always_inline int tcp_reply_reset(struct __sk_buff *skb, __u32 ifindex,
+					   enum reset_dir dir)
+{
+	struct tcphdr new_tcp = {};
+	struct ethhdr *l2;
+	struct iphdr *l3;
+	struct tcphdr *l4;
+	__be32 old_saddr, old_daddr, new_saddr, new_daddr;
+	__be16 old_tot_len, new_tot_len;
+	__u32 seq, ack_seq, new_skb_len;
+	__u32 seg_len, tcp_off, tcp_csum_off;
+	__u16 ip_hlen, new_ip_len;
+	long err;
+
+	if (dir > RESET_TO_WORLD)
+		return TC_ACT_SHOT;
+
+	if (skb->gso_segs)
+		return TC_ACT_SHOT;
+
+	if (!__pull_headers(skb, &l2, &l3, &l4))
+		return TC_ACT_SHOT;
+
+	if ((l3->frag_off & IP_FLAG_MF) || (l3->frag_off & IP_FRAG_OFF_MASK))
+		return TC_ACT_SHOT;
+
+	if (l4->rst)
+		return TC_ACT_SHOT;
+
+	ip_hlen = BPF_CORE_READ_BITFIELD(l3, ihl);
+	ip_hlen <<= 2;
+	seq = l4->seq;
+	ack_seq = l4->ack_seq;
+	if (!tcp_segment_len(l3, l4, &seg_len))
+		return TC_ACT_SHOT;
+
+	new_saddr = l3->daddr;
+	new_daddr = dir == RESET_TO_WORLD ? l3->saddr : mvm_inner_ip;
+	new_tcp.source = l4->dest;
+	new_tcp.dest = l4->source;
+	new_tcp.doff = sizeof(new_tcp) >> 2;
+	new_tcp.rst = 1;
+	if (l4->ack) {
+		new_tcp.seq = ack_seq;
+	} else {
+		new_tcp.ack_seq = bpf_htonl(bpf_ntohl(seq) + seg_len);
+		new_tcp.ack = 1;
+	}
+
+	new_ip_len = ip_hlen + sizeof(new_tcp);
+	new_skb_len = sizeof(struct ethhdr) + new_ip_len;
+	if (bpf_skb_change_tail(skb, new_skb_len, 0))
+		return TC_ACT_SHOT;
+
+	if (!__pull_headers(skb, &l2, &l3, &l4))
+		return TC_ACT_SHOT;
+
+	old_saddr = l3->saddr;
+	old_daddr = l3->daddr;
+	old_tot_len = l3->tot_len;
+	new_tot_len = bpf_htons(new_ip_len);
+	tcp_off = sizeof(struct ethhdr) + ip_hlen;
+	tcp_csum_off = TCP_CSUM_OFF(ip_hlen);
+	if (dir == RESET_TO_WORLD)
+		set_mac_pair(l2, nodenic_macaddr_p1, nodenic_macaddr_p2,
+			     nodegw_macaddr_p1, nodegw_macaddr_p2);
+	else
+		set_mac_pair(l2, cubegw0_macaddr_p1, cubegw0_macaddr_p2,
+			     mvm_macaddr_p1, mvm_macaddr_p2);
+
+	err = bpf_skb_store_bytes(skb, tcp_off, &new_tcp, sizeof(new_tcp), 0);
+	if (err)
+		return TC_ACT_SHOT;
+
+	err = rewrite_l3_tot_len(skb, old_tot_len, new_tot_len);
+	if (err)
+		return TC_ACT_SHOT;
+
+	err = bpf_l3_csum_replace(skb, IP_CSUM_OFF, old_saddr, new_saddr,
+				  sizeof(new_saddr));
+	if (err)
+		return TC_ACT_SHOT;
+	err = bpf_skb_store_bytes(skb, IP_SADDR_OFF, &new_saddr,
+				  sizeof(new_saddr), 0);
+	if (err)
+		return TC_ACT_SHOT;
+
+	err = bpf_l3_csum_replace(skb, IP_CSUM_OFF, old_daddr, new_daddr,
+				  sizeof(new_daddr));
+	if (err)
+		return TC_ACT_SHOT;
+	err = bpf_skb_store_bytes(skb, IP_DADDR_OFF, &new_daddr,
+				  sizeof(new_daddr), 0);
+	if (err)
+		return TC_ACT_SHOT;
+
+	err = tcp_ipv4_set_checksum(skb, tcp_csum_off, new_saddr, new_daddr,
+				    &new_tcp);
+	if (err)
+		return TC_ACT_SHOT;
+
+	return bpf_redirect(ifindex, 0);
 }
 
 static __always_inline bool create_new_sessions(struct __sk_buff *skb,

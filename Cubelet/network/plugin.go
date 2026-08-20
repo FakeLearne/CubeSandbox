@@ -91,6 +91,26 @@ func (m *delegateNetworkManager) ID() string {
 	return constants.NetworkID.ID()
 }
 
+// InvalidateSandboxConnections exposes the embedded runtime's generation bump
+// to the cubebox rollback service without leaking runtime implementation
+// details across plugin boundaries.
+func (m *delegateNetworkManager) CheckSandboxConnections(ctx context.Context, sandboxID string) error {
+	if m == nil || m.tapPlugin == nil || m.tapPlugin.networkRuntime == nil {
+		return fmt.Errorf("network runtime is not initialized")
+	}
+	return m.tapPlugin.networkRuntime.CheckSandboxConnections(ctx, sandboxID)
+}
+
+func (m *delegateNetworkManager) InvalidateSandboxConnections(
+	ctx context.Context,
+	sandboxID string,
+) (oldVersion uint32, newVersion uint32, err error) {
+	if m == nil || m.tapPlugin == nil || m.tapPlugin.networkRuntime == nil {
+		return 0, 0, fmt.Errorf("network runtime is not initialized")
+	}
+	return m.tapPlugin.networkRuntime.InvalidateSandboxConnections(ctx, sandboxID)
+}
+
 func (m *delegateNetworkManager) Init(ctx context.Context, opts *workflow.InitInfo) error {
 	log.G(ctx).Errorf("Init doing")
 	defer log.G(ctx).Errorf("Init end")

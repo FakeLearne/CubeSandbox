@@ -37,6 +37,11 @@ type fakeNetworkRuntime struct {
 	getTapFileCalls    int
 	lastTapSandboxID   string
 	lastTapName        string
+	invalidateCalls    []string
+	invalidateErr      error
+	checkErr           error
+	oldVersion         uint32
+	newVersion         uint32
 }
 
 func (c *fakeNetworkRuntime) EnsureNetwork(_ context.Context, req *networkruntime.EnsureNetworkRequest) (*networkruntime.EnsureNetworkResponse, error) {
@@ -114,6 +119,21 @@ func (c *fakeNetworkRuntime) GetTapFile(sandboxID, tapName string) (*os.File, er
 	return nil, errors.New("tap fd unavailable")
 }
 
+func (c *fakeNetworkRuntime) InvalidateSandboxConnections(
+	_ context.Context,
+	sandboxID string,
+) (uint32, uint32, error) {
+	c.invalidateCalls = append(c.invalidateCalls, sandboxID)
+	if c.invalidateErr != nil {
+		return c.oldVersion, 0, c.invalidateErr
+	}
+	return c.oldVersion, c.newVersion, nil
+}
+
+func (c *fakeNetworkRuntime) CheckSandboxConnections(_ context.Context, _ string) error {
+	return c.checkErr
+}
+
 func (c *fakeNetworkRuntime) DumpEgressPolicies(context.Context) (map[string]map[string]any, error) {
 	if c.dumpPolicies != nil {
 		return c.dumpPolicies, nil
@@ -163,6 +183,22 @@ func TestTapCreateWithNetworkRuntimeCallsEnsureNetwork(t *testing.T) {
 	shimInfo, ok := opts.NetworkInfo.(*networktypes.ShimNetReq)
 	if !ok || shimInfo == nil || len(shimInfo.Interfaces) != 1 || shimInfo.Interfaces[0].Name != "z192.168.0.40" {
 		t.Fatalf("NetworkInfo not populated from runtime response: %+v", opts.NetworkInfo)
+	}
+}
+
+func TestDelegateNetworkManagerInvalidatesSandboxConnections(t *testing.T) {
+	fakeClient := &fakeNetworkRuntime{oldVersion: 4, newVersion: 5}
+	manager := &delegateNetworkManager{tapPlugin: &local{networkRuntime: fakeClient}}
+
+	oldVersion, newVersion, err := manager.InvalidateSandboxConnections(context.Background(), "sandbox")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if oldVersion != 4 || newVersion != 5 {
+		t.Fatalf("versions=(%d,%d), want (4,5)", oldVersion, newVersion)
+	}
+	if len(fakeClient.invalidateCalls) != 1 || fakeClient.invalidateCalls[0] != "sandbox" {
+		t.Fatalf("invalidate calls=%v, want [sandbox]", fakeClient.invalidateCalls)
 	}
 }
 

@@ -32,6 +32,12 @@ type NetworkRuntime interface {
 	Health(ctx context.Context) error
 	// GetTapFile returns a caller-owned live TAP fd for the sandbox handoff path.
 	GetTapFile(sandboxID, tapName string) (*os.File, error)
+	// CheckSandboxConnections verifies the active TAP and CubeVS metadata
+	// without changing the current connection generation.
+	CheckSandboxConnections(ctx context.Context, sandboxID string) error
+	// InvalidateSandboxConnections advances the active sandbox's CubeVS
+	// connection generation. Existing TCP sessions no longer match afterwards.
+	InvalidateSandboxConnections(ctx context.Context, sandboxID string) (oldVersion uint32, newVersion uint32, err error)
 
 	// DumpEgressPolicies returns every active sandbox's L7 egress
 	// policy in the JSON shape CubeEgress's bootstrap.lua expects.

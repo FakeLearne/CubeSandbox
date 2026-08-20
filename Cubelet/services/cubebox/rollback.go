@@ -29,6 +29,9 @@ const (
 	shimUpdateRollbackAction            = "RollbackSnapshot"
 	shimUpdatePauseSnapshotAnnotation   = "cube.shimapi.update.pause.snapshot_config"
 	shimUpdatePauseToSnapshotAction     = "PauseToSnapshot"
+
+	connectionInvalidationAttempts   = 3
+	connectionInvalidationRetryDelay = 50 * time.Millisecond
 )
 
 type rollbackRestoreConfig struct {
@@ -78,6 +81,11 @@ func (s *service) RollbackSandbox(ctx context.Context, req *cubebox.RollbackSand
 		"snapshotID": req.GetSnapshotID(),
 		"newGen":     req.GetNewGen(),
 	})
+	if s.connectionInvalidator == nil {
+		rsp.Ret.RetCode = errorcode.ErrorCode_PreConditionFailed
+		rsp.Ret.RetMsg = "network connection invalidator is unavailable"
+		return rsp, nil
+	}
 
 	cb, err := s.cubeboxMgr.cubeboxManger.Get(ctx, req.GetSandboxID())
 	if err != nil {
@@ -145,6 +153,11 @@ func (s *service) RollbackSandbox(ctx context.Context, req *cubebox.RollbackSand
 		rsp.Ret.RetMsg = fmt.Sprintf("failed to build restore config: %v", err)
 		return rsp, nil
 	}
+	if err := s.connectionInvalidator.CheckSandboxConnections(ctx, req.GetSandboxID()); err != nil {
+		rsp.Ret.RetCode = errorcode.ErrorCode_PreConditionFailed
+		rsp.Ret.RetMsg = fmt.Sprintf("network connection invalidation preflight failed: %v", err)
+		return rsp, nil
+	}
 
 	rollbackTime := time.Now().UTC()
 	var rollbackTask containerd.Task
@@ -182,6 +195,24 @@ func (s *service) RollbackSandbox(ctx context.Context, req *cubebox.RollbackSand
 	}
 	cleanupNewRootfs = false
 
+	oldVersion, newVersion, invalidateErr := s.invalidateSandboxConnectionsWithRetry(
+		ctx,
+		req.GetSandboxID(),
+		connectionInvalidationAttempts,
+		connectionInvalidationRetryDelay,
+	)
+	if invalidateErr != nil {
+		warning := fmt.Sprintf("network connection invalidation deferred: %v", invalidateErr)
+		rsp.Ret.RetMsg = appendRollbackMessage(rsp.Ret.RetMsg, warning)
+		stepLog.Errorf("rollback restored VM but failed to invalidate historical connections: %v", invalidateErr)
+	} else {
+		stepLog.Infof(
+			"rollback invalidated historical connections: oldVersion=%d newVersion=%d",
+			oldVersion,
+			newVersion,
+		)
+	}
+
 	// Scrub any "terminated" markers a concurrent path may have stamped
 	// onto the in-memory Status while shim's delete_vm + resume_vm_with_config
 	// was running. We do NOT consult containerd here: the shim has already
@@ -214,7 +245,10 @@ func (s *service) RollbackSandbox(ctx context.Context, req *cubebox.RollbackSand
 	}
 	if err := storage.DeleteObject(ctx, currentRootfs.Name, currentRootfs.Kind); err != nil {
 		rsp.OldRootfsDeleted = false
-		rsp.Ret.RetMsg = fmt.Sprintf("rollback succeeded; old rootfs cleanup deferred: %v", err)
+		rsp.Ret.RetMsg = appendRollbackMessage(
+			rsp.Ret.RetMsg,
+			fmt.Sprintf("rollback succeeded; old rootfs cleanup deferred: %v", err),
+		)
 		stepLog.Warnf("rollback succeeded but failed to delete old rootfs %s: %v", currentRootfs.Name, err)
 	} else {
 		rsp.OldRootfsDeleted = true
@@ -222,6 +256,48 @@ func (s *service) RollbackSandbox(ctx context.Context, req *cubebox.RollbackSand
 
 	stepLog.Infof("RollbackSandbox completed successfully: newRootfs=%s oldRootfs=%s oldDeleted=%t", rsp.RootfsVol, rsp.OldRootfsVol, rsp.OldRootfsDeleted)
 	return rsp, nil
+}
+
+func appendRollbackMessage(current, message string) string {
+	if current == "" {
+		return message
+	}
+	return current + "; " + message
+}
+
+func (s *service) invalidateSandboxConnectionsWithRetry(
+	ctx context.Context,
+	sandboxID string,
+	attempts int,
+	delay time.Duration,
+) (oldVersion uint32, newVersion uint32, err error) {
+	if s.connectionInvalidator == nil {
+		return 0, 0, fmt.Errorf("network connection invalidator is unavailable")
+	}
+	if attempts < 1 {
+		attempts = 1
+	}
+
+	for attempt := 1; attempt <= attempts; attempt++ {
+		oldVersion, newVersion, err = s.connectionInvalidator.InvalidateSandboxConnections(ctx, sandboxID)
+		if err == nil {
+			return oldVersion, newVersion, nil
+		}
+		if attempt == attempts {
+			break
+		}
+
+		timer := time.NewTimer(delay)
+		select {
+		case <-ctx.Done():
+			if !timer.Stop() {
+				<-timer.C
+			}
+			return oldVersion, 0, ctx.Err()
+		case <-timer.C:
+		}
+	}
+	return oldVersion, 0, err
 }
 
 func runRollbackWithPreparedGuestMetrics(

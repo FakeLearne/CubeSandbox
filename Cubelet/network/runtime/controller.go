@@ -67,6 +67,9 @@ type NetworkController struct {
 	locks   *SandboxLocks
 	states  map[string]*managedState
 	tapPool *TapPool
+	// pendingConnectionInvalidations is a best-effort maintenance queue for
+	// rollbacks whose synchronous CubeVS version bump failed. Guarded by mu.
+	pendingConnectionInvalidations map[string]struct{}
 	// tapFds retains one runtime-owned fd per idle pooled TAP. The fd moves to
 	// the owning managedState at acquireTap and returns here on release, so the
 	// GetTapFile hot path only duplicates and never pays a TUNSETIFF. Guarded

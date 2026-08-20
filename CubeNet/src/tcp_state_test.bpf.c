@@ -81,4 +81,33 @@ int test_update_session(struct __sk_buff *skb)
 	return TC_ACT_OK;
 }
 
+/* Keep the independently typed original_sessions value covered by verifier
+ * loading without doubling the packet-driven state-machine test's branch
+ * graph.
+ */
+SEC("tc")
+int test_update_original_session(struct __sk_buff *skb)
+{
+	struct session sess = {
+		.access_time = 1,
+		.state = TCP_CONNTRACK_SYN_SENT,
+	};
+
+	update_original_session(IP_CT_DIR_REPLY, &sess, 2,
+				true, true, false, false);
+	return sess.state == TCP_CONNTRACK_SYN_RECV ? TC_ACT_OK : TC_ACT_SHOT;
+}
+
+SEC("tc")
+int test_tcp_reset_to_sandbox(struct __sk_buff *skb)
+{
+	return tcp_reply_reset(skb, 1, RESET_TO_SANDBOX);
+}
+
+SEC("tc")
+int test_tcp_reset_to_world(struct __sk_buff *skb)
+{
+	return tcp_reply_reset(skb, 1, RESET_TO_WORLD);
+}
+
 char __license[] SEC("license") = "Dual BSD/GPL";

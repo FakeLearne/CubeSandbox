@@ -83,6 +83,21 @@ struct {
 	__uint(pinning, LIBBPF_PIN_BY_NAME);
 } ingress_sessions SEC(".maps");
 
+/* Original-direction session table
+ *
+ * The first phase stores CubeProxy passive-accept TCP sessions here.  Reply
+ * packets reconstruct the original key by swapping their 5-tuple and adding
+ * the sandbox's current version, so no separate reply-side entry is needed.
+ */
+struct {
+	__uint(type, BPF_MAP_TYPE_HASH);
+	__uint(max_entries, MAX_SESSIONS);
+	__type(key, struct session_key);
+	__type(value, struct session);
+	__uint(pinning, LIBBPF_PIN_BY_NAME);
+	__uint(map_flags, BPF_F_NO_PREALLOC);
+} original_sessions SEC(".maps");
+
 /* SNAT IP list
  *
  * key:   index for hash(MVM_IP)

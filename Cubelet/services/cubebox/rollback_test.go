@@ -17,6 +17,26 @@ import (
 	cubeboxstore "github.com/tencentcloud/CubeSandbox/Cubelet/pkg/store/cubebox"
 )
 
+type fakeSandboxConnectionInvalidator struct {
+	errs  []error
+	calls int
+}
+
+func (f *fakeSandboxConnectionInvalidator) CheckSandboxConnections(context.Context, string) error {
+	return nil
+}
+
+func (f *fakeSandboxConnectionInvalidator) InvalidateSandboxConnections(
+	_ context.Context,
+	_ string,
+) (uint32, uint32, error) {
+	f.calls++
+	if f.calls <= len(f.errs) && f.errs[f.calls-1] != nil {
+		return 7, 0, f.errs[f.calls-1]
+	}
+	return 7, 8, nil
+}
+
 func TestRollbackDisksFromSnapshotSpecReplacesCurrentRootfs(t *testing.T) {
 	spec := &CubeboxSnapshotSpec{
 		Disk: json.RawMessage(`[
@@ -32,6 +52,39 @@ func TestRollbackDisksFromSnapshotSpecReplacesCurrentRootfs(t *testing.T) {
 	assert.Equal(t, "disk-0", disks[0].ID)
 	assert.Equal(t, "/dev/mapper/data", disks[1].Path)
 	assert.NotEmpty(t, disks[0].RateLimiterConfig)
+}
+
+func TestInvalidateSandboxConnectionsWithRetry(t *testing.T) {
+	transient := errors.New("transient map failure")
+	invalidator := &fakeSandboxConnectionInvalidator{errs: []error{transient, transient}}
+	s := &service{connectionInvalidator: invalidator}
+
+	oldVersion, newVersion, err := s.invalidateSandboxConnectionsWithRetry(
+		context.Background(),
+		"sandbox",
+		3,
+		0,
+	)
+	require.NoError(t, err)
+	assert.Equal(t, uint32(7), oldVersion)
+	assert.Equal(t, uint32(8), newVersion)
+	assert.Equal(t, 3, invalidator.calls)
+}
+
+func TestInvalidateSandboxConnectionsWithRetryExhausted(t *testing.T) {
+	permanent := errors.New("permanent map failure")
+	invalidator := &fakeSandboxConnectionInvalidator{errs: []error{permanent, permanent}}
+	s := &service{connectionInvalidator: invalidator}
+
+	_, newVersion, err := s.invalidateSandboxConnectionsWithRetry(
+		context.Background(),
+		"sandbox",
+		2,
+		0,
+	)
+	require.ErrorIs(t, err, permanent)
+	assert.Zero(t, newVersion)
+	assert.Equal(t, 2, invalidator.calls)
 }
 
 func TestRollbackDisksFromSnapshotSpecRejectsMissingRootfs(t *testing.T) {

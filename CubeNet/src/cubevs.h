@@ -321,6 +321,28 @@ struct nat_session {
 	__u8 reserved[32];
 };
 
+/* Original-direction session stored in original_sessions.
+ *
+ * Keep this layout aligned with nat_session while the legacy
+ * ingress_sessions + egress_sessions implementation is still present.  The
+ * types are deliberately distinct so the new single-table data path doesn't
+ * inherit the legacy NAT table's lookup semantics.
+ */
+struct session {
+	__u64 access_time;	/* stored in nanoseconds, div is expensive */
+	__u32 node_ifindex;
+	__u32 node_ip;
+	__u32 vm_ifindex;
+	__u32 vm_ip;
+	__u16 node_port;
+	__u16 vm_port;
+	__u8 state;
+	__u8 active_close;
+	__u8 packet_class;
+	__u8 l7_scheme;
+	__u8 reserved[32];
+};
+
 struct ingress_session {
 	__u32 version;
 	__u32 vm_ip;
@@ -389,11 +411,13 @@ static __always_inline int _()
 	int l[sizeof(struct mvm_port) == 8 ? 1 : -1] = {};
 	int n[sizeof(struct session_key) % 20 == 0 ? 1 : -1] = {};
 	int o[sizeof(struct nat_session) == 64 ? 1 : -1] = {};
+	int os[sizeof(struct session) == 64 ? 1 : -1] = {};
+	int osa[sizeof(struct session) == sizeof(struct nat_session) ? 1 : -1] = {};
 	int p[sizeof(struct ingress_session) % 16 == 0 ? 1 : -1] = {};
 	int q[sizeof(struct snat_ip) % 16 == 0 ? 1 : -1] = {};
 	int s[sizeof(struct l7_port_entry) == 4 ? 1 : -1] = {};
 
-	return b[0] + d[0] + dv3[0] + r[0] + rv3[0] + f[0] + g[0] + h[0] + i[0] + l[0] + n[0] + o[0] + p[0] + q[0] + s[0];
+	return b[0] + d[0] + dv3[0] + r[0] + rv3[0] + f[0] + g[0] + h[0] + i[0] + l[0] + n[0] + o[0] + os[0] + osa[0] + p[0] + q[0] + s[0];
 }
 
 static __always_inline __attribute__((used)) __u32 __btf_pin(void)

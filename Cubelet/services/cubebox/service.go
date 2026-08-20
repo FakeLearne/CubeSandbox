@@ -138,6 +138,15 @@ func init() {
 				return nil, fmt.Errorf("not a cubebox manager")
 			}
 
+			np, err := ic.GetByID(constants.InternalPlugin, constants.NetworkID.ID())
+			if err != nil {
+				return nil, err
+			}
+			connectionInvalidator, ok := np.(SandboxConnectionInvalidator)
+			if !ok {
+				return nil, fmt.Errorf("network plugin does not support sandbox connection invalidation")
+			}
+
 			p, err := ic.GetByID(constants.WorkflowPlugin, constants.WorkflowID.ID())
 			if err != nil {
 				return nil, err
@@ -156,6 +165,7 @@ func init() {
 				events:                ep.(*exchange.Exchange),
 				numaNodeIndex:         0,
 				sandboxLifecycleLocks: utils.NewResourceLocks(),
+				connectionInvalidator: connectionInvalidator,
 				otherRuntime: &ociRuntime{
 					cubeboxMgr: cb,
 				},
@@ -198,8 +208,17 @@ type service struct {
 	cubebox.UnimplementedCubeboxMgrServer
 	numaNodeIndex         uint32
 	sandboxLifecycleLocks *utils.ResourceLocks
+	connectionInvalidator SandboxConnectionInvalidator
 
 	otherRuntime *ociRuntime
+}
+
+type SandboxConnectionInvalidator interface {
+	CheckSandboxConnections(context.Context, string) error
+	InvalidateSandboxConnections(
+		context.Context,
+		string,
+	) (oldVersion uint32, newVersion uint32, err error)
 }
 
 func (s *service) RegisterTCP(server *grpc.Server) error {

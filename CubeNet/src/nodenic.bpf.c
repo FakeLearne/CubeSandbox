@@ -17,6 +17,70 @@
 #include "dns_query.h"
 #include "dns_response.h"
 
+/* Track CubeProxy passive-accept connections in their establishment
+ * direction (world -> sandbox).  The key uses the sandbox-visible listen
+ * port, not the host port, so the reply path can reconstruct it before SNAT.
+ */
+static __always_inline int
+touch_cubeproxy_session(const struct iphdr *l3, const struct tcphdr *l4,
+			const struct mvm_port *mvm_port)
+{
+	struct mvm_meta *mvm_meta;
+	struct session_key key = {};
+	struct session new_session = {};
+	struct session *sess;
+	bool syn, ack, fin, rst;
+	__u64 now;
+
+	mvm_meta = bpf_map_lookup_elem(&ifindex_to_mvmmeta, &mvm_port->ifindex);
+	if (!mvm_meta)
+		return -1;
+
+	key.src_ip = l3->saddr;
+	key.dst_ip = mvm_meta->ip;
+	key.src_port = l4->source;
+	key.dst_port = mvm_port->listen_port;
+	key.version = mvm_meta->version;
+	key.protocol = IPPROTO_TCP;
+
+	now = bpf_ktime_get_ns();
+	syn = l4->syn;
+	ack = l4->ack;
+	fin = l4->fin;
+	rst = l4->rst;
+
+	sess = bpf_map_lookup_elem(&original_sessions, &key);
+	if (sess) {
+		update_original_session(IP_CT_DIR_ORIGINAL, sess, now,
+					syn, ack, fin, rst);
+		return 0;
+	}
+
+	/* Mid-stream packets from an older generation must not recreate state. */
+	if (!(syn && !ack && !fin && !rst))
+		return -1;
+
+	new_session.access_time = now;
+	new_session.vm_ifindex = mvm_port->ifindex;
+	new_session.vm_ip = mvm_meta->ip;
+	new_session.vm_port = mvm_port->listen_port;
+	new_session.state = TCP_CONNTRACK_SYN_SENT;
+
+	if (bpf_map_update_elem(&original_sessions, &key, &new_session,
+				BPF_NOEXIST) == 0)
+		return 0;
+
+	/* A concurrent SYN may have won the BPF_NOEXIST race. Treat that as a
+	 * retransmission instead of resetting a valid new connection.
+	 */
+	sess = bpf_map_lookup_elem(&original_sessions, &key);
+	if (!sess)
+		return -1;
+	update_original_session(IP_CT_DIR_ORIGINAL, sess, now,
+				syn, ack, fin, rst);
+	return 0;
+}
+
 static int tcp_nat_proxy(struct __sk_buff *skb, struct ethhdr *l2, struct iphdr *l3, struct tcphdr *l4,
 			 struct mvm_port *mvm_port)
 {
@@ -374,8 +438,12 @@ static int do_tcp_nat(struct __sk_buff *skb)
 	if (skb->ifindex == nodenic_ifindex) {
 		dport = l4->dest;
 		mvm_port = bpf_map_lookup_elem(&remote_port_mapping, &dport);
-		if (mvm_port)
+		if (mvm_port) {
+			if (touch_cubeproxy_session(l3, l4, mvm_port) < 0)
+				return tcp_reply_reset(skb, nodenic_ifindex,
+						       RESET_TO_WORLD);
 			return tcp_nat_proxy(skb, l2, l3, l4, mvm_port);
+		}
 	}
 
 	return tcp_nat_session(skb, l2, l3, l4);

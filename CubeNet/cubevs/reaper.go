@@ -12,8 +12,9 @@ import (
 )
 
 const (
-	MapNameIngressSessions = "ingress_sessions"
-	MapNameEgressSessions  = "egress_sessions"
+	MapNameIngressSessions  = "ingress_sessions"
+	MapNameEgressSessions   = "egress_sessions"
+	MapNameOriginalSessions = "original_sessions"
 )
 
 const (
@@ -170,6 +171,23 @@ type natSession struct {
 	Reserved    [32]uint8
 }
 
+// session mirrors C struct session, the value of original_sessions.  Keep it
+// distinct from natSession even while their layouts match.
+type session struct {
+	AccessTime  uint64
+	NodeIfindex uint32
+	NodeIP      uint32
+	VMIfindex   uint32
+	VMIP        uint32
+	NodePort    uint16
+	VMPort      uint16
+	State       uint8
+	ActiveClose uint8
+	PacketClass uint8
+	L7Scheme    uint8
+	Reserved    [32]uint8
+}
+
 // timeout returns the timeout for the session in nanoseconds.
 func (s *natSession) tcpTimeout() uint64 {
 	if s.State == uint8(tcpCTTimeWait) && s.ActiveClose == 1 {
@@ -177,6 +195,13 @@ func (s *natSession) tcpTimeout() uint64 {
 		return uint64(tcpTimeouts[tcpCTClose].Nanoseconds())
 	}
 
+	return uint64(tcpTimeouts[tcpConntrackState(s.State)].Nanoseconds())
+}
+
+func (s *session) tcpTimeout() uint64 {
+	if s.State == uint8(tcpCTTimeWait) && s.ActiveClose == 1 {
+		return uint64(tcpTimeouts[tcpCTClose].Nanoseconds())
+	}
 	return uint64(tcpTimeouts[tcpConntrackState(s.State)].Nanoseconds())
 }
 
@@ -246,6 +271,7 @@ func doReap() {
 
 	for range ticker.C {
 		reapSessions()
+		reapOriginalSessions()
 		reapDNSState()
 	}
 }
@@ -268,11 +294,11 @@ func enqueueEvent(event Event) {
 	}
 }
 
-func reportCount(count int) {
+func reportCount(mapName string, count int) {
 	if float64(count) > maxSessions*maxSessionPercentage {
 		enqueueEvent(Event{
 			Error:   ErrSessionsTooMany,
-			Message: fmt.Sprintf("too many sessions: %d/%d", count, maxSessions),
+			Message: fmt.Sprintf("too many sessions in %s: %d/%d", mapName, count, maxSessions),
 		})
 	}
 }
@@ -300,6 +326,18 @@ func sessionClosedNormally(key *sessionKey, sess *natSession) bool {
 	default:
 		return sess.State == uint8(tcpCTClose) || sess.State == uint8(tcpCTTimeWait)
 	}
+}
+
+func originalSessionDisposition(
+	now uint64,
+	key *sessionKey,
+	sess *session,
+	currentVersion uint32,
+	orphan bool,
+) (deleteEntry bool, expired bool, staleGeneration bool) {
+	expired = now > sess.AccessTime+sess.tcpTimeout()
+	staleGeneration = !orphan && key.Version != currentVersion
+	return expired || staleGeneration || orphan, expired, staleGeneration
 }
 
 func deleteSessions(egressSessions, ingressSessions *ebpf.Map,
@@ -399,5 +437,121 @@ func reapSessions() {
 		return
 	}
 
-	reportCount(count)
+	reportCount(MapNameEgressSessions, count)
+}
+
+func reapOriginalSessions() {
+	original, err := loadPinnedMap(MapNameOriginalSessions)
+	if err != nil {
+		enqueueEvent(Event{
+			Error:   err,
+			Message: "failed to load original session map",
+		})
+		return
+	}
+	defer original.Close()
+
+	metadata, err := loadPinnedMap(MapNameIfindexToMVMMetadata)
+	if err != nil {
+		enqueueEvent(Event{
+			Error:   err,
+			Message: "failed to load TAP metadata map for original sessions",
+		})
+		return
+	}
+	defer metadata.Close()
+
+	now, err := currentNS()
+	if err != nil {
+		enqueueEvent(Event{
+			Error:   err,
+			Message: "failed to get current time for original sessions",
+		})
+		return
+	}
+
+	type versionResult struct {
+		version uint32
+		orphan  bool
+		err     error
+	}
+	versions := make(map[uint32]versionResult)
+	var (
+		key   sessionKey
+		value session
+		count int
+	)
+	iter := original.Iterate()
+	for iter.Next(&key, &value) {
+		count++
+
+		result, ok := versions[value.VMIfindex]
+		if !ok {
+			var meta mvmMetadata
+			lookupErr := metadata.Lookup(&value.VMIfindex, &meta)
+			switch {
+			case lookupErr == nil:
+				result.version = meta.Version
+			case errors.Is(lookupErr, ebpf.ErrKeyNotExist):
+				result.orphan = true
+			default:
+				result.err = lookupErr
+				enqueueEvent(Event{
+					Error: lookupErr,
+					Message: fmt.Sprintf(
+						"failed to look up TAP metadata for original session ifindex %d",
+						value.VMIfindex,
+					),
+				})
+			}
+			versions[value.VMIfindex] = result
+		}
+
+		if result.err != nil {
+			continue
+		}
+
+		deleteEntry, expired, staleGeneration := originalSessionDisposition(
+			now,
+			&key,
+			&value,
+			result.version,
+			result.orphan,
+		)
+		if !deleteEntry {
+			continue
+		}
+
+		if err := original.Delete(&key); err != nil && !errors.Is(err, ebpf.ErrKeyNotExist) {
+			enqueueEvent(Event{
+				Error:   err,
+				Message: "failed to delete original session",
+			})
+			continue
+		}
+
+		if expired && !staleGeneration && !result.orphan &&
+			value.State != uint8(tcpCTClose) &&
+			value.State != uint8(tcpCTTimeWait) {
+			enqueueEvent(Event{
+				Error: ErrSessionExpiredNotClosed,
+				Message: fmt.Sprintf(
+					"cubeproxy session %s:%d->%s:%d expired in state %s",
+					uint32ToIP(key.SourceIP), ntohs(key.SourcePort),
+					uint32ToIP(key.TargetIP), ntohs(key.TargetPort),
+					tcpConntrackState(value.State),
+				),
+			})
+		}
+	}
+
+	if err := iter.Err(); err != nil {
+		enqueueEvent(Event{
+			Error:   err,
+			Message: "failed to iterate original session map",
+		})
+		return
+	}
+
+	reportCount(MapNameOriginalSessions, count)
 }
