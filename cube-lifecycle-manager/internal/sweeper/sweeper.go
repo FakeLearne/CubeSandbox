@@ -16,6 +16,8 @@ import (
 	"go.uber.org/zap"
 
 	"github.com/tencentcloud/CubeSandbox/cube-lifecycle-manager/internal/cubemasterclient"
+	"github.com/tencentcloud/CubeSandbox/cube-lifecycle-manager/internal/leader"
+	"github.com/tencentcloud/CubeSandbox/cube-lifecycle-manager/internal/lifecycle"
 	"github.com/tencentcloud/CubeSandbox/cube-lifecycle-manager/internal/registry"
 )
 
@@ -48,8 +50,15 @@ type Options struct {
 	// zero, defaults to Now() at construction time.
 	StartedAt time.Time
 
+	// ActionTimeout bounds individual pause or kill decision execution.
+	ActionTimeout time.Duration
+
 	Now func() time.Time // injectable for tests
 	Log *zap.Logger
+
+	// Leader gates singleton pause/kill work. Nil preserves the historical
+	// single-instance behavior for tests and deployments with election off.
+	Leader leader.Status
 }
 
 // Sweeper iterates the registry on a fixed interval. It is intended to run as
@@ -92,6 +101,10 @@ func (s *Sweeper) Run(ctx context.Context) error {
 // sweepOnce is exported (lowercase but called via tests in the same package)
 // so the test can drive a single iteration deterministically.
 func (s *Sweeper) sweepOnce(ctx context.Context) {
+	if s.o.Leader != nil && !s.o.Leader.IsLeader() {
+		return
+	}
+
 	now := s.o.Now()
 	nowMs := now.UnixMilli()
 
@@ -167,6 +180,9 @@ func (s *Sweeper) sweepOnce(ctx context.Context) {
 
 		switch {
 		case e.Meta.AutoPause:
+			if s.o.Leader != nil && !s.o.Leader.IsLeader() {
+				return
+			}
 			s.o.Log.Info("idle threshold exceeded; pausing",
 				zap.String("sandbox_id", e.Meta.SandboxID),
 				zap.Duration("idle_for", idleFor),
@@ -180,6 +196,9 @@ func (s *Sweeper) sweepOnce(ctx context.Context) {
 					zap.Error(err))
 			}
 		default:
+			if s.o.Leader != nil && !s.o.Leader.IsLeader() {
+				return
+			}
 			s.o.Log.Info("idle threshold exceeded; killing",
 				zap.String("sandbox_id", e.Meta.SandboxID),
 				zap.Duration("idle_for", idleFor),
@@ -197,6 +216,24 @@ func (s *Sweeper) sweepOnce(ctx context.Context) {
 	}
 }
 
+const (
+	advisoryPushTimeout  = time.Second
+	terminalWriteReserve = 2 * time.Second
+)
+
+// rpcContext carves the CubeMaster call out of the action budget, holding
+// terminalWriteReserve back so a slow pause/kill cannot starve the terminal
+// state writes that follow it. parent always carries a deadline: it comes
+// from context.WithTimeout(ctx, ActionTimeout).
+func rpcContext(parent context.Context) (context.Context, context.CancelFunc) {
+	deadline, _ := parent.Deadline()
+	timeout := time.Until(deadline.Add(-terminalWriteReserve))
+	if timeout <= 0 {
+		timeout = time.Millisecond
+	}
+	return context.WithTimeout(parent, timeout)
+}
+
 // tryPause acquires the state lock, calls CubeMaster, and pushes the new
 // state out to CubeProxy. It is idempotent — a lost SETNX race is treated as
 // success (someone else is pausing the same sandbox).
@@ -212,6 +249,9 @@ func (s *Sweeper) sweepOnce(ctx context.Context) {
 //     already where we wanted it (peer CLM replica / earlier failed-but-applied
 //     attempt). Treat exactly like a fresh successful pause.
 func (s *Sweeper) tryPause(ctx context.Context, e registry.Entry) error {
+	ctx, cancel := context.WithTimeout(ctx, s.o.ActionTimeout)
+	defer cancel()
+
 	sid := e.Meta.SandboxID
 	got, err := s.o.Redis.AcquireState(ctx, sid, "pausing", s.o.StateLockTTL)
 	if err != nil {
@@ -224,13 +264,18 @@ func (s *Sweeper) tryPause(ctx context.Context, e registry.Entry) error {
 
 	// Tell CubeProxy first that the sandbox is pausing, so any new requests
 	// hit the 503 retry path immediately and don't race the rpc.
-	if err := s.o.ProxyPush.SetState(ctx, sid, "pausing"); err != nil {
+	// Use a small slice of the budget so an unreachable proxy cannot starve the RPC.
+	prePushCtx, preCancel := context.WithTimeout(ctx, advisoryPushTimeout)
+	if err := s.o.ProxyPush.SetState(prePushCtx, sid, "pausing"); err != nil {
 		s.o.Log.Warn("push pausing state failed",
 			zap.String("sandbox_id", sid), zap.Error(err))
 		// Continue anyway — the rpc and final state push are still useful.
 	}
+	preCancel()
 
-	pauseErr := s.o.CubeMaster.Pause(ctx, sid, e.Meta.InstanceType)
+	rpcCtx, rpcCancel := rpcContext(ctx)
+	pauseErr := s.o.CubeMaster.Pause(rpcCtx, sid, e.Meta.InstanceType)
+	rpcCancel()
 	if pauseErr != nil {
 		var apiErr *cubemasterclient.APIError
 		switch {
@@ -256,9 +301,17 @@ func (s *Sweeper) tryPause(ctx context.Context, e registry.Entry) error {
 				zap.Int("ret_code", apiErr.RetCode))
 			// no return — proceed to success bookkeeping below
 		default:
-			// Real failure. Roll back: clear the pausing state so a future
-			// sweep can retry, and tell CubeProxy the sandbox is back to
-			// running (it never actually paused).
+			// A transport or timeout error has an unknown server-side result.
+			// Do NOT clear state and broadcast "running": if the VM was actually
+			// paused, CubeProxy will route requests to a frozen VM without resume.
+			// Retain "pausing" ownership for the ambiguity window so a concurrent or
+			// subsequent check does not race.
+			if !errors.As(pauseErr, &apiErr) {
+				return errors.New("cubemaster pause result unknown: " + pauseErr.Error())
+			}
+			// Real failure (definitive APIError). Roll back: clear the pausing
+			// state so a future sweep can retry, and tell CubeProxy the sandbox
+			// is back to running (it never actually paused).
 			_ = s.o.Redis.ClearStateNotify(ctx, sid)
 			_ = s.o.ProxyPush.SetState(ctx, sid, "running")
 			return errors.New("cubemaster pause: " + pauseErr.Error())
@@ -269,6 +322,7 @@ func (s *Sweeper) tryPause(ctx context.Context, e registry.Entry) error {
 		s.o.Log.Warn("write paused state failed",
 			zap.String("sandbox_id", sid), zap.Error(err))
 	}
+	s.o.Registry.SetRuntimeState(sid, lifecycle.StatePaused)
 	if err := s.o.ProxyPush.SetState(ctx, sid, "paused"); err != nil {
 		s.o.Log.Warn("push paused state failed",
 			zap.String("sandbox_id", sid), zap.Error(err))
@@ -300,6 +354,9 @@ func (s *Sweeper) KillStats() (triggered, failed int64) {
 // `killed` to 410 Gone so any in-flight client request fails fast instead of
 // hanging on a doomed retry.
 func (s *Sweeper) tryKill(ctx context.Context, e registry.Entry) error {
+	ctx, cancel := context.WithTimeout(ctx, s.o.ActionTimeout)
+	defer cancel()
+
 	sid := e.Meta.SandboxID
 	got, err := s.o.Redis.AcquireState(ctx, sid, "killing", s.o.StateLockTTL)
 	if err != nil {
@@ -311,12 +368,16 @@ func (s *Sweeper) tryKill(ctx context.Context, e registry.Entry) error {
 		return nil
 	}
 
-	if err := s.o.ProxyPush.SetState(ctx, sid, "killing"); err != nil {
+	prePushCtx, preCancel := context.WithTimeout(ctx, advisoryPushTimeout)
+	if err := s.o.ProxyPush.SetState(prePushCtx, sid, "killing"); err != nil {
 		s.o.Log.Warn("push killing state failed",
 			zap.String("sandbox_id", sid), zap.Error(err))
 	}
+	preCancel()
 
-	killErr := s.o.CubeMaster.Kill(ctx, sid, e.Meta.InstanceType, cubemasterclient.KillReasonTimeout)
+	rpcCtx, rpcCancel := rpcContext(ctx)
+	killErr := s.o.CubeMaster.Kill(rpcCtx, sid, e.Meta.InstanceType, cubemasterclient.KillReasonTimeout)
+	rpcCancel()
 	if killErr != nil {
 		var apiErr *cubemasterclient.APIError
 		switch {
@@ -330,6 +391,12 @@ func (s *Sweeper) tryKill(ctx context.Context, e registry.Entry) error {
 				zap.String("sandbox_id", sid),
 				zap.Int("ret_code", apiErr.RetCode))
 		default:
+			// A transport or timeout error has an unknown server-side result.
+			// Do NOT clear state and broadcast "running". Retain "killing"
+			// marker so proxy continues to reject requests and sweeper does not flap.
+			if !errors.As(killErr, &apiErr) {
+				return errors.New("cubemaster kill result unknown: " + killErr.Error())
+			}
 			_ = s.o.Redis.ClearStateNotify(ctx, sid)
 			_ = s.o.ProxyPush.SetState(ctx, sid, "running")
 			return errors.New("cubemaster kill: " + killErr.Error())

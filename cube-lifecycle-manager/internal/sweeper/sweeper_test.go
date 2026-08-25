@@ -180,10 +180,16 @@ func newTestSweeper(reg *registry.Registry, store *fakeStore, master *fakeMaster
 		BootstrapWarmup:    0,
 		StateLockTTL:       30 * time.Second,
 		Interval:           time.Second,
+		ActionTimeout:      13 * time.Second,
 		Now:                func() time.Time { return at },
 		Log:                zap.NewNop(),
 	})
 }
+
+type stubLeaderStatus bool
+
+func (s stubLeaderStatus) IsLeader() bool { return bool(s) }
+func (s stubLeaderStatus) Enabled() bool  { return true }
 
 // seedEntry inserts a registry entry. Unlike the previous grace-period
 // design, the sweeper now bases its idle decision on max(LastActiveMs,
@@ -195,6 +201,29 @@ func seedEntry(t *testing.T, r *registry.Registry, meta lifecycle.SandboxLifecyc
 		if !r.MergeLastActive(meta.SandboxID, lastActiveMs) {
 			t.Fatalf("seed: MergeLastActive(%s, %d) didn't advance", meta.SandboxID, lastActiveMs)
 		}
+	}
+}
+
+func TestSweeper_StandbySkipsIdleWork(t *testing.T) {
+	reg := registry.New()
+	store := newFakeStore()
+	master := &fakeMaster{}
+	push := newFakePush()
+	now := time.Now()
+	seedEntry(t, reg, lifecycle.SandboxLifecycleMeta{
+		SandboxID: "sbx-standby", InstanceType: "cubebox",
+		AutoPause: true, TimeoutSeconds: lifecycle.TimeoutSecondsPtr(1),
+	}, now.Add(-time.Minute).UnixMilli())
+
+	s := newTestSweeper(reg, store, master, push, now)
+	s.o.Leader = stubLeaderStatus(false)
+	s.sweepOnce(context.Background())
+
+	if len(master.calls) != 0 {
+		t.Fatalf("standby must not pause sandboxes: %v", master.calls)
+	}
+	if got := store.state("sbx-standby"); got != "" {
+		t.Fatalf("standby must not mutate state, got %q", got)
 	}
 }
 
@@ -276,7 +305,10 @@ func TestSweeper_SkipsSandboxWithoutAutoPause(t *testing.T) {
 func TestSweeper_KillRollsBackOnFailure(t *testing.T) {
 	reg := registry.New()
 	store := newFakeStore()
-	master := &fakeMaster{failNextKill: true, failKillErr: errors.New("master 500")}
+	master := &fakeMaster{failNextKill: true, failKillErr: &cubemasterclient.APIError{
+		RetCode: 999,
+		RetMsg:  "definitive failure",
+	}}
 	push := newFakePush()
 
 	now := time.Now()
@@ -297,6 +329,37 @@ func TestSweeper_KillRollsBackOnFailure(t *testing.T) {
 	}
 	if reg.Get("sbx-killfail") == nil {
 		t.Fatal("registry entry should NOT be evicted on kill failure")
+	}
+	_, failed := s.KillStats()
+	if failed != 1 {
+		t.Fatalf("expected kill failed=1, got %d", failed)
+	}
+}
+
+func TestSweeper_KillPreservesOwnershipOnUnknownError(t *testing.T) {
+	reg := registry.New()
+	store := newFakeStore()
+	master := &fakeMaster{failNextKill: true, failKillErr: errors.New("connection reset")}
+	push := newFakePush()
+
+	now := time.Now()
+	seedEntry(t, reg, lifecycle.SandboxLifecycleMeta{
+		SandboxID: "sbx-killunknown", InstanceType: "cubebox",
+		AutoPause: false, TimeoutSeconds: lifecycle.TimeoutSecondsPtr(60),
+	}, now.Add(-10*time.Minute).UnixMilli())
+
+	s := newTestSweeper(reg, store, master, push, now)
+	s.sweepOnce(context.Background())
+
+	if got := store.state("sbx-killunknown"); got != "killing" {
+		t.Fatalf("redis state should remain killing on unknown error, got %q", got)
+	}
+	pushed := push.states("sbx-killunknown")
+	if len(pushed) != 1 || pushed[0] != "killing" {
+		t.Fatalf("proxy must not be rolled back to running on unknown kill, got %v", pushed)
+	}
+	if reg.Get("sbx-killunknown") == nil {
+		t.Fatal("registry entry should NOT be evicted on unknown kill error")
 	}
 	_, failed := s.KillStats()
 	if failed != 1 {
@@ -412,7 +475,10 @@ func TestSweeper_BootstrapWarmupSkipsBootstrapEntries(t *testing.T) {
 func TestSweeper_RollsBackOnPauseFailure(t *testing.T) {
 	reg := registry.New()
 	store := newFakeStore()
-	master := &fakeMaster{failNext: true, failError: errors.New("master 500")}
+	master := &fakeMaster{failNext: true, failError: &cubemasterclient.APIError{
+		RetCode: 999,
+		RetMsg:  "definitive failure",
+	}}
 	push := newFakePush()
 
 	now := time.Now()
@@ -430,6 +496,34 @@ func TestSweeper_RollsBackOnPauseFailure(t *testing.T) {
 	pushed := push.states("sbx-4")
 	if len(pushed) == 0 || pushed[len(pushed)-1] != "running" {
 		t.Fatalf("rollback should leave proxy at running, got %v", pushed)
+	}
+	_, failed := s.Stats()
+	if failed != 1 {
+		t.Fatalf("expected failed=1, got %d", failed)
+	}
+}
+
+func TestSweeper_PausePreservesOwnershipOnUnknownError(t *testing.T) {
+	reg := registry.New()
+	store := newFakeStore()
+	master := &fakeMaster{failNext: true, failError: errors.New("connection reset")}
+	push := newFakePush()
+
+	now := time.Now()
+	seedEntry(t, reg, lifecycle.SandboxLifecycleMeta{
+		SandboxID: "sbx-pauseunknown", InstanceType: "cubebox",
+		AutoPause: true, TimeoutSeconds: lifecycle.TimeoutSecondsPtr(60),
+	}, now.Add(-10*time.Minute).UnixMilli())
+
+	s := newTestSweeper(reg, store, master, push, now)
+	s.sweepOnce(context.Background())
+
+	if got := store.state("sbx-pauseunknown"); got != "pausing" {
+		t.Fatalf("redis state should remain pausing on unknown error, got %q", got)
+	}
+	pushed := push.states("sbx-pauseunknown")
+	if len(pushed) != 1 || pushed[0] != "pausing" {
+		t.Fatalf("proxy must not be rolled back to running on unknown pause, got %v", pushed)
 	}
 	_, failed := s.Stats()
 	if failed != 1 {
