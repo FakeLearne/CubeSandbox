@@ -788,7 +788,16 @@ fn default_log_limit() -> i32 {
 ///
 /// `allowPublicTraffic` and `maskRequestHost` are CubeSandbox extensions; E2B's
 /// update schema carries neither.
+///
+/// Unknown fields are rejected. Under full-replacement semantics a key that fails
+/// to match is indistinguishable from one deliberately left out, so a typo like
+/// `allowOu` would clear that policy dimension and answer 204 -- and combined with
+/// an omitted `allowInternetAccess` it reopens egress the caller was restricting.
+/// Failing the request is the only outcome that cannot be mistaken for success.
+/// E2B's own update body carries only `allowOut`, `denyOut`, `rules` and
+/// `allowInternetAccess`, all accepted here, so strictness costs no compatibility.
 #[derive(Debug, Deserialize, ToSchema)]
+#[serde(deny_unknown_fields)]
 pub struct UpdateSandboxNetworkRequest {
     #[serde(rename = "allowInternetAccess", alias = "allow_internet_access")]
     pub allow_internet_access: Option<bool>,
@@ -932,6 +941,24 @@ mod tests {
         let (internet, net) = update_parts("{}").expect("valid body");
         assert!(internet.is_none());
         assert!(net.is_none());
+    }
+
+    #[test]
+    fn update_network_rejects_bodies_that_would_silently_clear_the_policy() {
+        // openapi.yml used to document the nested create shape for this endpoint.
+        // A client following it sent the whole policy under `network`, which
+        // deserialized into an all-None body and replaced the sandbox's egress
+        // policy with the platform default -- public egress reopened, answered
+        // with 204. A misspelled key clears one dimension the same silent way.
+        // Both have to fail, because under full replacement a key that does not
+        // match is indistinguishable from one deliberately omitted.
+        for body in [
+            r#"{"network": {"allowOut": ["8.8.8.8"]}}"#,
+            r#"{"allowOu": ["8.8.8.8"]}"#,
+        ] {
+            serde_json::from_str::<UpdateSandboxNetworkRequest>(body)
+                .expect_err(&format!("body must be rejected: {body}"));
+        }
     }
 
     #[test]
