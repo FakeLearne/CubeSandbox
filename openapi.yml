@@ -2366,17 +2366,39 @@ components:
         Request body for PUT /sandboxes/{id}/network.
 
         The body is the complete desired egress policy, not a patch: any field left
-        out clears what the sandbox currently has. This mirrors how `network` is
-        interpreted at create time, so the same object can be sent to either.
+        out clears what the sandbox currently has. Fields sit at the top level
+        (E2B's update shape), not nested under `network`. Unknown fields are
+        rejected so a typo cannot silently clear a policy dimension.
       properties:
         allowInternetAccess:
           type:
           - boolean
           - 'null'
-        network:
+        allowOut:
+          type:
+          - array
+          - 'null'
+          items:
+            type: string
+        allowPublicTraffic:
+          type:
+          - boolean
+          - 'null'
+        denyOut:
+          type:
+          - array
+          - 'null'
+          items:
+            type: string
+        maskRequestHost:
+          type:
+          - string
+          - 'null'
+        rules:
           oneOf:
           - type: 'null'
-          - $ref: '#/components/schemas/SandboxNetworkConfig'
+          - $ref: '#/components/schemas/SandboxNetworkRulesInput'
+      additionalProperties: false
     Volume:
       type: object
       description: Volume descriptor returned in list responses (no token).
