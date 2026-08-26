@@ -169,7 +169,7 @@ func UpdateNetwork(ctx context.Context, req *types.UpdateNetworkRequest) (rsp *t
 		ctx = context.WithoutCancel(ctx)
 		hostIP, ok := resolveSandboxHostIP(ctx, req.SandboxID)
 		if !ok {
-			rsp.Ret.RetCode = int(errorcode.ErrorCode_MasterParamsError)
+			rsp.Ret.RetCode = int(errorcode.ErrorCode_NotFound)
 			rsp.Ret.RetMsg = "sandbox not found"
 			return nil
 		}

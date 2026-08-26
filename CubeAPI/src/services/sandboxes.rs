@@ -523,11 +523,11 @@ impl SandboxService {
             .cubemaster
             .update_sandbox_network(&req)
             .await
-            .map_err(|e| sandbox_not_found_or_internal(e, sandbox_id))?;
+            .map_err(|e| map_update_cubemaster_err(e, sandbox_id))?;
 
         resp.ret
             .into_result()
-            .map_err(|e| sandbox_not_found_or_internal(e, sandbox_id))?;
+            .map_err(|e| map_update_cubemaster_err(e, sandbox_id))?;
 
         Ok(())
     }
@@ -1321,6 +1321,30 @@ mod tests {
             .await
             .expect_err("rejected timeout update should not succeed");
         assert_bad_request(err, reason);
+    }
+
+    #[tokio::test]
+    async fn update_network_maps_cubemaster_conflict_to_conflict() {
+        // The handler's utoipa annotation, the examples README and the Go SDK all
+        // promise 409 for a sandbox that is not running. Cubelet reports it as
+        // 130409 and CubeMaster forwards it verbatim, so mapping anything but
+        // not-found to internal turned a documented client-state condition into a
+        // 500 and charged it against the server's error rate.
+        let reason = "sandbox is paused";
+        let service = spawn_fake_cubemaster(Router::new().route(
+            "/cube/sandbox/network",
+            post(move || async move { ret_envelope(130409, reason) }),
+        ))
+        .await;
+
+        let err = service
+            .update_network("sbx-1", Some(false), None)
+            .await
+            .expect_err("a paused sandbox must not report a successful update");
+        match err {
+            AppError::Conflict(message) => assert_eq!(message, reason),
+            other => panic!("expected conflict error, got {other:?}"),
+        }
     }
 
     #[tokio::test]
