@@ -54,10 +54,6 @@ func checkParam(ctx context.Context, realReq *cubebox.RunCubeSandboxRequest) err
 			return ret.Errorf(errorcode.ErrorCode_InvalidParamFormat, "invalid exposed port %d", p)
 		}
 	}
-	if len(realReq.GetExposedPorts()) > 4 {
-		return ret.Errorf(errorcode.ErrorCode_InvalidParamFormat,
-			"exposed ports should be at most 4")
-	}
 
 	if err != nil {
 		return ret.Err(errorcode.ErrorCode_InvalidParamFormat, err.Error())

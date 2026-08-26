@@ -281,7 +281,7 @@ func TestCheckParamExposedPorts(t *testing.T) {
 		assert.NoError(t, err)
 	})
 
-	t.Run("valid ports within limit", func(t *testing.T) {
+	t.Run("valid ports", func(t *testing.T) {
 		err := checkParam(ctx, &cubebox.RunCubeSandboxRequest{
 			ExposedPorts: []int64{49983, 80, 443, 8080},
 		})
@@ -304,11 +304,10 @@ func TestCheckParamExposedPorts(t *testing.T) {
 		assert.Contains(t, err.Error(), "invalid exposed port")
 	})
 
-	t.Run("rejects more than 4 ports", func(t *testing.T) {
+	t.Run("allows more than 4 ports", func(t *testing.T) {
 		err := checkParam(ctx, &cubebox.RunCubeSandboxRequest{
 			ExposedPorts: []int64{49983, 80, 443, 8080, 9000},
 		})
-		assert.Error(t, err)
-		assert.Contains(t, err.Error(), "at most 4")
+		assert.NoError(t, err)
 	})
 }

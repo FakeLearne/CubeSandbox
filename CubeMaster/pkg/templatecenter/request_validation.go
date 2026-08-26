@@ -259,26 +259,5 @@ func normalizeTemplateExposedPorts(ports []int32) ([]int32, error) {
 	sort.Slice(normalized, func(i, j int) bool {
 		return normalized[i] < normalized[j]
 	})
-	if countCustomTemplateExposedPorts(normalized) > 3 {
-		return nil, fmt.Errorf("at most 3 custom exposed ports are supported")
-	}
 	return normalized, nil
-}
-
-func countCustomTemplateExposedPorts(ports []int32) int {
-	reserved := defaultTemplateExposedPorts()
-	count := 0
-	for _, port := range ports {
-		if _, ok := reserved[port]; ok {
-			continue
-		}
-		count++
-	}
-	return count
-}
-
-func defaultTemplateExposedPorts() map[int32]struct{} {
-	return map[int32]struct{}{
-		49983: {},
-	}
 }

@@ -251,46 +251,19 @@ func TestNormalizeTemplateImageRequestAllowsCIDRAllowOutWithoutDenyAll(t *testin
 	}
 }
 
-func TestNormalizeTemplateImageRequestRejectsTooManyCustomExposedPorts(t *testing.T) {
-
-	_, err := normalizeTemplateImageRequest(&types.CreateTemplateFromImageReq{
+func TestNormalizeTemplateImageRequestAllowsMoreThanThreeCustomExposedPorts(t *testing.T) {
+	req, err := normalizeTemplateImageRequest(&types.CreateTemplateFromImageReq{
 		Request:           &types.Request{RequestID: "req-1"},
 		SourceImageRef:    "docker.io/library/nginx:latest",
 		WritableLayerSize: "20Gi",
-		ExposedPorts:      []int32{9000, 9001, 9002, 9003},
+		ExposedPorts:      []int32{9000, 9001, 9002, 9003, 80},
 	})
-	if err == nil || !strings.Contains(err.Error(), "at most 3 custom exposed ports") {
-		t.Fatalf("unexpected error: %v", err)
+	if err != nil {
+		t.Fatalf("normalizeTemplateImageRequest failed: %v", err)
 	}
-}
-
-func TestDefaultTemplateExposedPortsContainsOnly49983(t *testing.T) {
-	got := defaultTemplateExposedPorts()
-	want := map[int32]struct{}{49983: {}}
-	if !reflect.DeepEqual(got, want) {
-		t.Fatalf("defaultTemplateExposedPorts()=%v, want %v", got, want)
-	}
-}
-
-func TestCountCustomTemplateExposedPortsTreats49983AsReserved(t *testing.T) {
-	if count := countCustomTemplateExposedPorts([]int32{49983, 9000}); count != 1 {
-		t.Fatalf("countCustomTemplateExposedPorts([49983, 9000])=%d, want 1", count)
-	}
-	if count := countCustomTemplateExposedPorts([]int32{8080, 9000}); count != 2 {
-		t.Fatalf("countCustomTemplateExposedPorts([8080, 9000])=%d, want 2", count)
-	}
-}
-
-func TestNormalizeTemplateImageRequestTreatsOnlyCubeletDefaultsAsReserved(t *testing.T) {
-
-	_, err := normalizeTemplateImageRequest(&types.CreateTemplateFromImageReq{
-		Request:           &types.Request{RequestID: "req-1"},
-		SourceImageRef:    "docker.io/library/nginx:latest",
-		WritableLayerSize: "20Gi",
-		ExposedPorts:      []int32{80, 9000, 9001, 9002},
-	})
-	if err == nil || !strings.Contains(err.Error(), "at most 3 custom exposed ports") {
-		t.Fatalf("unexpected error: %v", err)
+	want := []int32{80, 9000, 9001, 9002, 9003}
+	if !reflect.DeepEqual(req.ExposedPorts, want) {
+		t.Fatalf("ExposedPorts=%v, want %v", req.ExposedPorts, want)
 	}
 }
 
