@@ -15,6 +15,9 @@ const (
 	flowVerdictSNAT         = uint8(1)
 	flowVerdictHTTP         = uint8(2)
 	flowVerdictHTTPS        = uint8(3)
+	ipprotoICMP             = uint8(1)
+	ipprotoTCP              = uint8(6)
+	ipprotoUDP              = uint8(17)
 )
 
 type egressPolicyTestEnv struct {
@@ -108,11 +111,19 @@ func runEgressPolicyCase(t *testing.T, prog *ebpf.Program, ifindex, daddr uint32
 	dport uint16,
 ) uint8 {
 	t.Helper()
+	return runEgressPolicyCaseProto(t, prog, ifindex, daddr, dport, ipprotoTCP)
+}
+
+func runEgressPolicyCaseProto(t *testing.T, prog *ebpf.Program, ifindex, daddr uint32,
+	dport uint16, protocol uint8,
+) uint8 {
+	t.Helper()
 
 	data := make([]byte, egressPolicyTestCaseLen)
 	binary.LittleEndian.PutUint32(data[0:4], ifindex)
 	binary.LittleEndian.PutUint32(data[4:8], daddr)
 	binary.LittleEndian.PutUint16(data[8:10], dport)
+	data[11] = protocol
 	ret, out, err := prog.Test(data)
 	if err != nil {
 		if bpfTestUnavailable(err) {
@@ -265,7 +276,42 @@ func TestClassifyEgressFlowL7UnknownSchemeFailsClosed(t *testing.T) {
 	}
 
 	if got := runEgressPolicyCase(t, env.program, ifindex, daddr, dport); got != flowVerdictReject {
-		t.Fatalf("verdict=%d, want FLOW_REJECT (fail closed on unknown scheme)", got)
+		t.Fatalf("TCP verdict=%d, want FLOW_REJECT (fail closed on unknown scheme)", got)
+	}
+	if got := runEgressPolicyCaseProto(t, env.program, ifindex, daddr, dport, ipprotoUDP); got != flowVerdictSNAT {
+		t.Fatalf("UDP verdict=%d, want FLOW_SNAT", got)
+	}
+}
+
+func TestClassifyEgressFlowUDPAndICMPOnL7PortAreSNAT(t *testing.T) {
+	env := loadEgressPolicyTestEnv(t)
+	ifindex := uint32(153)
+	allowInner, denyInner := env.attachInnerMaps(t, ifindex)
+	daddr := mustParseCIDRForTest(t, "192.0.2.23").IP
+	dport := htonsPort(443)
+	allowKey := lpmKeyV3{Prefixlen: 48, IP: daddr, Port: dport}
+	allowValue := netPolicyValueV3{
+		Flags:  uint8(netPolicyFlagL7Required),
+		Scheme: L7SchemeHTTPS,
+	}
+	if err := allowInner.Put(&allowKey, &allowValue); err != nil {
+		t.Fatalf("insert exact L7 HTTPS allow rule: %v", err)
+	}
+
+	denyAll := mustParseCIDRForTest(t, "0.0.0.0/0")
+	denyValue := uint32(1)
+	if err := denyInner.Put(&denyAll, &denyValue); err != nil {
+		t.Fatalf("insert deny-all rule: %v", err)
+	}
+
+	if got := runEgressPolicyCase(t, env.program, ifindex, daddr, dport); got != flowVerdictHTTPS {
+		t.Fatalf("TCP verdict=%d, want FLOW_HTTPS", got)
+	}
+	if got := runEgressPolicyCaseProto(t, env.program, ifindex, daddr, dport, ipprotoUDP); got != flowVerdictSNAT {
+		t.Fatalf("UDP verdict=%d, want FLOW_SNAT", got)
+	}
+	if got := runEgressPolicyCaseProto(t, env.program, ifindex, daddr, dport, ipprotoICMP); got != flowVerdictSNAT {
+		t.Fatalf("ICMP verdict=%d, want FLOW_SNAT", got)
 	}
 }
 
@@ -375,8 +421,9 @@ func TestSessionPolicyRevoked(t *testing.T) {
 		schemeNone  = uint8(0)
 		schemeHTTP  = uint8(1)
 		schemeHTTPS = uint8(2)
-		protoTCP    = uint8(6)  // IPPROTO_TCP
-		protoUDP    = uint8(17) // IPPROTO_UDP
+		protoTCP    = uint8(6)
+		protoUDP    = uint8(17)
+		protoICMP   = uint8(1)
 	)
 
 	env := loadEgressPolicyTestEnv(t)
@@ -443,7 +490,7 @@ func TestSessionPolicyRevoked(t *testing.T) {
 		},
 		{
 			// SNAT and L7 disagree on the reply tuple and on who terminates
-			// the connection, so a TCP flow cannot migrate between them.
+			// the connection, so a flow cannot migrate between them.
 			name: "verdict change SNAT to L7 is revoked",
 			tc: sessionRecheckCase{
 				ifindex: ifindex, daddr: l7Host.IP, dport: otherPort,
@@ -474,13 +521,20 @@ func TestSessionPolicyRevoked(t *testing.T) {
 			wantVersion: 6,
 		},
 		{
-			// UDP is always SNAT. classify_egress_flow has no protocol, so an
-			// L7 allow on :443 still returns FLOW_HTTPS for QUIC; that standing
-			// mismatch is not a policy change and must not kill the flow.
 			name: "UDP SNAT against an L7 dest is restamped",
 			tc: sessionRecheckCase{
 				ifindex: ifindex, daddr: l7Host.IP, dport: otherPort,
 				packetClass: packetSNAT, l7Scheme: schemeNone, protocol: protoUDP,
+				sessPolicyVersion: 5, metaPolicyVersion: 6,
+			},
+			wantRevoked: false,
+			wantVersion: 6,
+		},
+		{
+			name: "ICMP SNAT against an L7 dest is restamped",
+			tc: sessionRecheckCase{
+				ifindex: ifindex, daddr: l7Host.IP, dport: otherPort,
+				packetClass: packetSNAT, l7Scheme: schemeNone, protocol: protoICMP,
 				sessPolicyVersion: 5, metaPolicyVersion: 6,
 			},
 			wantRevoked: false,

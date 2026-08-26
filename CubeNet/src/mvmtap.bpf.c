@@ -390,7 +390,7 @@ static __always_inline __u32 do_icmp_nat(struct __sk_buff *skb, struct mvm_meta 
 
 	/* create new session */
 	if (classify_egress_flow(skb->ingress_ifindex, key.dst_ip,
-				 key.dst_port) == FLOW_REJECT)
+				 key.dst_port, key.protocol) == FLOW_REJECT)
 		return 0;
 	snat_ip = pick_snat_ip_port(mvm_meta->ip, &key, &snat_id);
 	if (!snat_ip || !snat_ip->ip || !snat_id)
@@ -499,7 +499,7 @@ static __always_inline __u32 do_udp_nat_inline(struct __sk_buff *skb,
 
 	/* create new session */
 	if (classify_egress_flow(skb->ingress_ifindex, key.dst_ip,
-				 key.dst_port) == FLOW_REJECT)
+				 key.dst_port, key.protocol) == FLOW_REJECT)
 		return 0;
 	snat_ip = pick_snat_ip_port(mvm_meta->ip, &key, &snat_port);
 	if (!snat_ip || !snat_ip->ip || !snat_port)
@@ -672,7 +672,7 @@ do_create:
 	 * cached in nat_session and reused for every later packet.
 	 */
 	verdict = classify_egress_flow(skb->ingress_ifindex, key.dst_ip,
-				       key.dst_port);
+				       key.dst_port, key.protocol);
 	switch (verdict) {
 	case FLOW_HTTP:
 	case FLOW_HTTPS:
@@ -1047,7 +1047,7 @@ int from_cube(struct __sk_buff *skb)
 		 * behavior of the do_tcp_nat() path; UDP/ICMP silently drop.
 		 * dport is 0 because the original check was port-agnostic.
 		 */
-		switch (classify_egress_flow(ifindex, daddr, 0)) {
+		switch (classify_egress_flow(ifindex, daddr, 0, proto)) {
 		case FLOW_REJECT:
 			if (proto == IPPROTO_TCP)
 				return tcp_send_reset(skb, skb->ingress_ifindex, mvm_inner_ip);

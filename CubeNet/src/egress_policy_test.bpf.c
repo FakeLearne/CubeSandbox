@@ -12,7 +12,8 @@ struct egress_policy_case {
 	__u32 daddr;
 	__u16 dport;
 	__u8 verdict;
-	__u8 reserved[5];
+	__u8 protocol;
+	__u8 reserved[4];
 };
 
 SEC("tc")
@@ -23,7 +24,8 @@ int test_classify_egress_flow(struct __sk_buff *skb)
 	if (bpf_skb_load_bytes(skb, 0, &tc, sizeof(tc)))
 		return TC_ACT_SHOT;
 
-	tc.verdict = classify_egress_flow(tc.ifindex, tc.daddr, tc.dport);
+	tc.verdict = classify_egress_flow(tc.ifindex, tc.daddr, tc.dport,
+					  tc.protocol);
 	if (bpf_skb_store_bytes(skb, 0, &tc, sizeof(tc), 0))
 		return TC_ACT_SHOT;
 
@@ -60,7 +62,7 @@ int test_session_policy_revoked(struct __sk_buff *skb)
 
 	tc.revoked = session_policy_revoked(&sess, tc.meta_policy_version,
 					    tc.ifindex, tc.daddr, tc.dport,
-					    tc.protocol);
+					    tc.protocol ? tc.protocol : IPPROTO_TCP);
 	tc.policy_version_out = sess.policy_version;
 
 	if (bpf_skb_store_bytes(skb, 0, &tc, sizeof(tc), 0))

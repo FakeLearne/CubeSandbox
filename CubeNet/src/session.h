@@ -156,16 +156,18 @@ enum flow_verdict {
 
 /**
  * classify_egress_flow - single egress policy decision for a candidate flow
- * @ifindex: TAP ifindex of the originating MVM (policy key)
- * @daddr:   destination IP address in network byte order
- * @dport:   destination port in network byte order (0 for port-agnostic)
+ * @ifindex:  TAP ifindex of the originating MVM (policy key)
+ * @daddr:    destination IP address in network byte order
+ * @dport:    destination port in network byte order (0 for port-agnostic)
+ * @protocol: IPPROTO_* of the candidate flow
  *
  * Priority: allow_out_v3 > deny_out > default allow.
  *
  *   1. Look up (daddr, dport)/48 in allow_out_v3. LPM automatically falls
  *      back to a matching /32 or subnet entry. A non-expired L7_REQUIRED
- *      entry returns FLOW_HTTP / FLOW_HTTPS; any other non-expired allow
- *      entry returns FLOW_SNAT.
+ *      entry returns FLOW_HTTP / FLOW_HTTPS only for TCP: L7 intercept is a
+ *      TCP TPROXY path. UDP and ICMP that hit the same allow entry return
+ *      FLOW_SNAT. Any other non-expired allow entry returns FLOW_SNAT.
  *   2. Else if deny_out matches a /32 (or wider) entry, the flow is
  *      rejected (FLOW_REJECT).
  *   3. Otherwise the flow is allowed via SNAT (default allow).
@@ -180,7 +182,7 @@ enum flow_verdict {
  * through to deny_out (e.g. 0.0.0.0/0) and was silently dropped.
  */
 static __always_inline __u8 classify_egress_flow(__u32 ifindex, __u32 daddr,
-						 __u16 dport)
+						 __u16 dport, __u8 protocol)
 {
 	struct lpm_key_v3 key = {};
 	struct net_policy_value_v3 *value;
@@ -202,7 +204,8 @@ static __always_inline __u8 classify_egress_flow(__u32 ifindex, __u32 daddr,
 		value = bpf_map_lookup_elem(inner_map, &key);
 		if (value && (value->expires_at_ns == 0 ||
 			      value->expires_at_ns > now)) {
-			if (value->flags & NET_POLICY_FLAG_L7_REQUIRED) {
+			if ((value->flags & NET_POLICY_FLAG_L7_REQUIRED) &&
+			    protocol == IPPROTO_TCP) {
 				if (value->scheme == L7_SCHEME_HTTP)
 					return FLOW_HTTP;
 				if (value->scheme == L7_SCHEME_HTTPS)
@@ -265,7 +268,7 @@ static __always_inline __u8 session_verdict(const struct nat_session *sess)
  * @ifindex:   TAP ifindex of the originating MVM
  * @daddr:     destination IP in network byte order
  * @dport:     destination port in network byte order (0 for ICMP)
- * @protocol:  IPPROTO_* of the flow, from the session key
+ * @protocol:  IPPROTO_* passed through to classify_egress_flow
  *
  * Returns true when this flow may no longer carry traffic. Callers retire the
  * session pair with del_session() and reject the packet: TCP answers with an RST
@@ -277,14 +280,10 @@ static __always_inline __u8 session_verdict(const struct nat_session *sess)
  * flow cannot resume even if a subsequent update re-allows the destination,
  * while a SYN legitimately opens a fresh connection under the current policy.
  *
- * A verdict *change* counts as revocation, not just FLOW_REJECT, but only for
- * TCP. Once a TCP flow must switch between plain SNAT and L7 interception there
- * is no way to migrate it -- the two paths disagree on both the reply tuple and
- * who terminates the connection -- so the flow is retired and the client
- * reconnects. UDP and ICMP are always SNAT; classify_egress_flow has no
- * protocol, so an L7 allow on the same (ip, port) returns FLOW_HTTP/HTTPS for
- * them too. That standing mismatch is not a policy change and must not kill
- * the flow. Non-TCP sessions are therefore revoked only on FLOW_REJECT.
+ * A verdict *change* counts as revocation, not just FLOW_REJECT. Once a flow
+ * must switch between plain SNAT and L7 interception there is no way to migrate
+ * it -- the two paths disagree on both the reply tuple and who terminates the
+ * TCP connection -- so the flow is retired and the client reconnects.
  *
  * Called before update_session(): there is no point advancing the conntrack
  * state of a flow that is about to be deleted.
@@ -307,10 +306,8 @@ static __always_inline bool session_policy_revoked(struct nat_session *sess,
 	if (sess->policy_version == policy_version)
 		return false;
 
-	verdict = classify_egress_flow(ifindex, daddr, dport);
-	if (verdict == FLOW_REJECT)
-		return true;
-	if (protocol == IPPROTO_TCP && verdict != session_verdict(sess))
+	verdict = classify_egress_flow(ifindex, daddr, dport, protocol);
+	if (verdict == FLOW_REJECT || verdict != session_verdict(sess))
 		return true;
 	sess->policy_version = policy_version;
 	return false;
