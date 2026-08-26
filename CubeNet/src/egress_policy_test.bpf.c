@@ -41,7 +41,8 @@ struct session_recheck_case {
 	__u8 packet_class;
 	__u8 l7_scheme;
 	__u8 revoked;
-	__u8 reserved[3];
+	__u8 protocol;
+	__u8 reserved[2];
 };
 
 SEC("tc")
@@ -58,7 +59,8 @@ int test_session_policy_revoked(struct __sk_buff *skb)
 	sess.policy_version = tc.sess_policy_version;
 
 	tc.revoked = session_policy_revoked(&sess, tc.meta_policy_version,
-					    tc.ifindex, tc.daddr, tc.dport);
+					    tc.ifindex, tc.daddr, tc.dport,
+					    tc.protocol);
 	tc.policy_version_out = sess.policy_version;
 
 	if (bpf_skb_store_bytes(skb, 0, &tc, sizeof(tc), 0))

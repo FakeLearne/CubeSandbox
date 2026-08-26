@@ -380,7 +380,7 @@ static __always_inline __u32 do_icmp_nat(struct __sk_buff *skb, struct mvm_meta 
 		 * there is nothing to reset on ICMP
 		 */
 		if (session_policy_revoked(sess, policy_version, skb->ingress_ifindex,
-					   key.dst_ip, key.dst_port)) {
+					   key.dst_ip, key.dst_port, key.protocol)) {
 			del_session(&key, sess);
 			return 0;
 		}
@@ -489,7 +489,7 @@ static __always_inline __u32 do_udp_nat_inline(struct __sk_buff *skb,
 		 * there is nothing to reset on UDP
 		 */
 		if (session_policy_revoked(sess, policy_version, skb->ingress_ifindex,
-					   key.dst_ip, key.dst_port)) {
+					   key.dst_ip, key.dst_port, key.protocol)) {
 			del_session(&key, sess);
 			return 0;
 		}
@@ -734,7 +734,7 @@ do_update:
 	 * as a probe, deferring the revocation by one more packet.
 	 */
 	if (session_policy_revoked(sess, policy_version, skb->ingress_ifindex,
-				   key.dst_ip, key.dst_port)) {
+				   key.dst_ip, key.dst_port, key.protocol)) {
 		del_session(&key, sess);
 		return rst ? TCP_NAT_DROP : TCP_NAT_RESET;
 	}

@@ -322,6 +322,7 @@ type sessionRecheckCase struct {
 	dport             uint16
 	packetClass       uint8
 	l7Scheme          uint8
+	protocol          uint8
 }
 
 type sessionRecheckResult struct {
@@ -340,6 +341,7 @@ func runSessionRecheckCase(t *testing.T, prog *ebpf.Program, tc sessionRecheckCa
 	binary.LittleEndian.PutUint16(data[20:22], tc.dport)
 	data[22] = tc.packetClass
 	data[23] = tc.l7Scheme
+	data[25] = tc.protocol
 
 	ret, out, err := prog.Test(data)
 	if err != nil {
@@ -373,6 +375,8 @@ func TestSessionPolicyRevoked(t *testing.T) {
 		schemeNone  = uint8(0)
 		schemeHTTP  = uint8(1)
 		schemeHTTPS = uint8(2)
+		protoTCP    = uint8(6)  // IPPROTO_TCP
+		protoUDP    = uint8(17) // IPPROTO_UDP
 	)
 
 	env := loadEgressPolicyTestEnv(t)
@@ -439,11 +443,11 @@ func TestSessionPolicyRevoked(t *testing.T) {
 		},
 		{
 			// SNAT and L7 disagree on the reply tuple and on who terminates
-			// the connection, so a flow cannot migrate between them.
+			// the connection, so a TCP flow cannot migrate between them.
 			name: "verdict change SNAT to L7 is revoked",
 			tc: sessionRecheckCase{
 				ifindex: ifindex, daddr: l7Host.IP, dport: otherPort,
-				packetClass: packetSNAT, l7Scheme: schemeNone,
+				packetClass: packetSNAT, l7Scheme: schemeNone, protocol: protoTCP,
 				sessPolicyVersion: 5, metaPolicyVersion: 6,
 			},
 			wantRevoked: true,
@@ -453,7 +457,7 @@ func TestSessionPolicyRevoked(t *testing.T) {
 			name: "verdict change L7 scheme is revoked",
 			tc: sessionRecheckCase{
 				ifindex: ifindex, daddr: l7Host.IP, dport: otherPort,
-				packetClass: packetL7, l7Scheme: schemeHTTP,
+				packetClass: packetL7, l7Scheme: schemeHTTP, protocol: protoTCP,
 				sessPolicyVersion: 5, metaPolicyVersion: 6,
 			},
 			wantRevoked: true,
@@ -463,7 +467,20 @@ func TestSessionPolicyRevoked(t *testing.T) {
 			name: "unchanged L7 verdict is restamped",
 			tc: sessionRecheckCase{
 				ifindex: ifindex, daddr: l7Host.IP, dport: otherPort,
-				packetClass: packetL7, l7Scheme: schemeHTTPS,
+				packetClass: packetL7, l7Scheme: schemeHTTPS, protocol: protoTCP,
+				sessPolicyVersion: 5, metaPolicyVersion: 6,
+			},
+			wantRevoked: false,
+			wantVersion: 6,
+		},
+		{
+			// UDP is always SNAT. classify_egress_flow has no protocol, so an
+			// L7 allow on :443 still returns FLOW_HTTPS for QUIC; that standing
+			// mismatch is not a policy change and must not kill the flow.
+			name: "UDP SNAT against an L7 dest is restamped",
+			tc: sessionRecheckCase{
+				ifindex: ifindex, daddr: l7Host.IP, dport: otherPort,
+				packetClass: packetSNAT, l7Scheme: schemeNone, protocol: protoUDP,
 				sessPolicyVersion: 5, metaPolicyVersion: 6,
 			},
 			wantRevoked: false,

@@ -265,6 +265,7 @@ static __always_inline __u8 session_verdict(const struct nat_session *sess)
  * @ifindex:   TAP ifindex of the originating MVM
  * @daddr:     destination IP in network byte order
  * @dport:     destination port in network byte order (0 for ICMP)
+ * @protocol:  IPPROTO_* of the flow, from the session key
  *
  * Returns true when this flow may no longer carry traffic. Callers retire the
  * session pair with del_session() and reject the packet: TCP answers with an RST
@@ -276,10 +277,14 @@ static __always_inline __u8 session_verdict(const struct nat_session *sess)
  * flow cannot resume even if a subsequent update re-allows the destination,
  * while a SYN legitimately opens a fresh connection under the current policy.
  *
- * A verdict *change* counts as revocation, not just FLOW_REJECT. Once a flow
- * must switch between plain SNAT and L7 interception there is no way to migrate
- * it -- the two paths disagree on both the reply tuple and who terminates the
- * TCP connection -- so the flow is retired and the client reconnects.
+ * A verdict *change* counts as revocation, not just FLOW_REJECT, but only for
+ * TCP. Once a TCP flow must switch between plain SNAT and L7 interception there
+ * is no way to migrate it -- the two paths disagree on both the reply tuple and
+ * who terminates the connection -- so the flow is retired and the client
+ * reconnects. UDP and ICMP are always SNAT; classify_egress_flow has no
+ * protocol, so an L7 allow on the same (ip, port) returns FLOW_HTTP/HTTPS for
+ * them too. That standing mismatch is not a policy change and must not kill
+ * the flow. Non-TCP sessions are therefore revoked only on FLOW_REJECT.
  *
  * Called before update_session(): there is no point advancing the conntrack
  * state of a flow that is about to be deleted.
@@ -295,7 +300,7 @@ static __always_inline __u8 session_verdict(const struct nat_session *sess)
 static __always_inline bool session_policy_revoked(struct nat_session *sess,
 						   __u32 policy_version,
 						   __u32 ifindex, __u32 daddr,
-						   __u16 dport)
+						   __u16 dport, __u8 protocol)
 {
 	__u8 verdict;
 
@@ -303,7 +308,9 @@ static __always_inline bool session_policy_revoked(struct nat_session *sess,
 		return false;
 
 	verdict = classify_egress_flow(ifindex, daddr, dport);
-	if (verdict == FLOW_REJECT || verdict != session_verdict(sess))
+	if (verdict == FLOW_REJECT)
+		return true;
+	if (protocol == IPPROTO_TCP && verdict != session_verdict(sess))
 		return true;
 	sess->policy_version = policy_version;
 	return false;
