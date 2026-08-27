@@ -294,6 +294,12 @@ static __always_inline struct snat_ip *pick_snat_ip_port(__u32 mvm_ip, const str
  * source-NATed, so the reply tuple is the exact reverse of the sandbox's
  * original tuple. create_nat_session() later inserts the matching egress value
  * and rolls this reservation back if that insertion fails.
+ *
+ * TAP reuse / rollback can leave that reverse slot occupied. Copy the occupant
+ * version first, delete that generation's egress so the reaper cannot later
+ * tear down this ingress, then delete the stale ingress and re-insert with
+ * BPF_NOEXIST. Same-generation L7 TIME_WAIT never reaches here: do_tcp_nat
+ * finds that egress first and RSTs.
  */
 static __always_inline bool create_l7_ingress_session(const struct session_key *ekey)
 {
@@ -310,6 +316,22 @@ static __always_inline bool create_l7_ingress_session(const struct session_key *
 		.version = 0,
 		.protocol = ekey->protocol,
 	};
+	struct ingress_session *old;
+	struct session_key old_ekey = {};
+	__u32 old_version;
+
+	old = bpf_map_lookup_elem(&ingress_sessions, &ikey);
+	if (old) {
+		old_version = old->version;
+		old_ekey.src_ip = ikey.dst_ip;
+		old_ekey.dst_ip = ikey.src_ip;
+		old_ekey.src_port = ikey.dst_port;
+		old_ekey.dst_port = ikey.src_port;
+		old_ekey.version = old_version;
+		old_ekey.protocol = ikey.protocol;
+		bpf_map_delete_elem(&egress_sessions, &old_ekey);
+		bpf_map_delete_elem(&ingress_sessions, &ikey);
+	}
 
 	return bpf_map_update_elem(&ingress_sessions, &ikey, &isess,
 				   BPF_NOEXIST) == 0;
