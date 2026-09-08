@@ -136,7 +136,15 @@ func run() error {
 				// Replay metadata and terminal state to the newly-arrived
 				// proxy. We must not block the discovery refresh loop, so
 				// this runs in its own goroutine.
-				go replayRegistryTo(rootCtx, pushClient, stream, reg, ep, logger.Named("replay"))
+				go func() {
+					replayLog := logger.Named("replay")
+					states := snapshotPromotionStates(rootCtx, stream, reg, replayLog)
+					// Snapshot can outlive this replica's leadership.
+					if !activeLeader.IsLeader() {
+						return
+					}
+					replayRegistryTo(rootCtx, pushClient, states, reg, ep, replayLog)
+				}()
 			},
 			OnLeave: func(proxyID string) {
 				logger.Info("proxy left; further broadcasts will skip it",
@@ -211,7 +219,6 @@ func run() error {
 		TTL:       cfg.StateLockTTL,
 		Log:       logger.Named("statesync"),
 		Leader:    activeLeader,
-		Persister: lease,
 	}
 
 	errs := make(chan error, loopCount)
@@ -229,7 +236,7 @@ func run() error {
 		errs <- reconcileOnLeadership(
 			rootCtx, lease, activeLeader, stream, pushClient, reg, fleet,
 			stateSyncDeps, streamProgress, &eventApplyMu,
-			cfg.LeaderRetryInterval, cfg.HTTPTimeout, logger.Named("promotion"),
+			cfg.LeaderRetryInterval, cfg.HTTPTimeout, cfg.StateLockTTL, logger.Named("promotion"),
 		)
 	}()
 	if discSvc != nil {
@@ -237,7 +244,10 @@ func run() error {
 	} else if !cfg.LeaderElectionEnabled {
 		// Static fleet has no OnJoin; with election disabled there is also no
 		// promotion hydrate, so push the snapshot once at startup.
-		go hydrateFleet(rootCtx, pushClient, stream, reg, fleet, activeLeader, logger.Named("replay"))
+		go func() {
+			states := snapshotPromotionStates(rootCtx, stream, reg, logger.Named("replay"))
+			hydrateFleet(rootCtx, pushClient, states, reg, fleet, activeLeader, logger.Named("replay"))
+		}()
 	}
 	if cfg.EventBusEnabled {
 		sub := eventbus.NewSubscriber(rdb, bus, logger.Named("eventbus"))
@@ -347,7 +357,9 @@ func (s fleetSizer) Snapshot() int {
 
 // replayRegistryTo pushes metadata and terminal state to a single admin
 // endpoint. Used by discovery.OnJoin and best-effort fleet hydration.
-func replayRegistryTo(ctx context.Context, push *proxypush.Client, stream *redisstream.Client,
+// Re-resolve each entry against the live registry so a later paused event
+// is not overwritten by a stale running value in states.
+func replayRegistryTo(ctx context.Context, push *proxypush.Client, states map[string]string,
 	reg *registry.Registry, ep discovery.Endpoint, log *zap.Logger) bool {
 
 	entries := reg.Snapshot()
@@ -367,14 +379,7 @@ func replayRegistryTo(ctx context.Context, push *proxypush.Client, stream *redis
 				zap.String("sandbox_id", e.Meta.SandboxID), zap.Error(err))
 			continue
 		}
-		state, err := resolvePromotionState(ctx, stream, e)
-		if err != nil {
-			failed++
-			log.Warn("replay state read failed",
-				zap.String("proxy_id", ep.ProxyID),
-				zap.String("sandbox_id", e.Meta.SandboxID), zap.Error(err))
-			continue
-		}
+		state := resolvePromotionState(e.RuntimeState, states[e.Meta.SandboxID])
 		if state == lifecycle.StatePaused || state == lifecycle.StateRunning {
 			if err := push.SetStateTo(ctx, ep.AdminURL, e.Meta.SandboxID, state); err != nil {
 				failed++
@@ -392,7 +397,7 @@ func replayRegistryTo(ctx context.Context, push *proxypush.Client, stream *redis
 	return failed == 0
 }
 
-func hydrateFleet(ctx context.Context, push *proxypush.Client, stream *redisstream.Client,
+func hydrateFleet(ctx context.Context, push *proxypush.Client, states map[string]string,
 	reg *registry.Registry, fleet proxypush.Fleet, active leader.Status, log *zap.Logger) {
 
 	if fleet == nil {
@@ -405,21 +410,22 @@ func hydrateFleet(ctx context.Context, push *proxypush.Client, stream *redisstre
 		if active != nil && !active.IsLeader() {
 			return
 		}
-		replayRegistryTo(ctx, push, stream, reg, ep, log)
+		replayRegistryTo(ctx, push, states, reg, ep, log)
 	}
 }
 
-// reconcileOnLeadership catches the newly promoted replica up to the stream
-// high-water, waits one CubeProxy HTTP timeout so in-flight writes from the
-// previous leader can finish, catches up again, then allows singleton work.
+// reconcileOnLeadership waits until the newly promoted replica's XREAD cursor
+// has reached the stream high-water, waits one CubeProxy HTTP timeout so
+// in-flight writes from the previous leader can finish, catches up again,
+// reconciles the shared Redis state keys, then allows singleton work.
 // The HTTP drain runs only when the lease generation changed; a same-generation
-// restore (stream trim) must not stall singleton work. Catch-up CAS's terminal
-// state into the shared Redis key (lease holder) but does not push CubeProxy;
-// fleet hydration is best-effort afterwards and must not gate leadership.
+// restore (stream trim) must not stall singleton work. Catch-up itself does
+// not write Redis — reconcileSharedState does that afterwards. Fleet hydration
+// is best-effort and must not gate leadership.
 func reconcileOnLeadership(ctx context.Context, lease *leader.Lease, active *reconciledLeader,
 	stream *redisstream.Client, push *proxypush.Client, reg *registry.Registry,
 	fleet proxypush.Fleet, ssDeps statesync.Deps, progress *streamProgress,
-	eventApplyMu *sync.Mutex, interval, drain time.Duration, log *zap.Logger) error {
+	eventApplyMu *sync.Mutex, interval, drain, ttl time.Duration, log *zap.Logger) error {
 
 	if interval <= 0 {
 		interval = time.Second
@@ -443,10 +449,14 @@ func reconcileOnLeadership(ctx context.Context, lease *leader.Lease, active *rec
 				caughtUp = catchUpGeneration(ctx, generation, lease, stream, push, reg, ssDeps, progress, eventApplyMu, log)
 			}
 			if caughtUp && lease.IsLeader() && generation == lease.Generation() {
-				active.markReconciled(generation)
-				log.Info("leadership catch-up complete", zap.Uint64("generation", generation))
-				if needDrain {
-					go hydrateFleet(ctx, push, stream, reg, fleet, active, log)
+				states, recErr := reconcileSharedState(ctx, stream, reg, ttl, log)
+				if recErr != nil {
+					log.Warn("leadership state reconcile failed; retrying",
+						zap.Uint64("generation", generation), zap.Error(recErr))
+				} else {
+					active.markReconciled(generation)
+					log.Info("leadership catch-up complete", zap.Uint64("generation", generation))
+					go hydrateFleet(ctx, push, states, reg, fleet, active, log)
 				}
 			} else if lease.IsLeader() {
 				log.Warn("leadership catch-up incomplete; retrying",
@@ -484,19 +494,92 @@ func catchUpGeneration(ctx context.Context, generation uint64, lease *leader.Lea
 	return true
 }
 
-func resolvePromotionState(
-	ctx context.Context, stream *redisstream.Client, entry registry.Entry,
-) (string, error) {
-	// After promotion catch-up the lease holder has CAS'd terminal state
-	// events into this key, so it is at least as fresh as RuntimeState.
-	state, ok, err := stream.GetState(ctx, entry.Meta.SandboxID)
+// resolvePromotionState picks the state a newly promoted leader should publish.
+// local is the newest terminal state seen on the lifecycle stream; shared is
+// the Redis state key. They disagree only when the previous leader died
+// mid-write, and neither side carries a trustworthy timestamp, so take the
+// conservative answer: a wrong "paused" costs one extra auto-resume, a wrong
+// "running" routes traffic to a stopped VM.
+// Shared markers (pausing/resuming/killing/killed) return empty so the
+// in-flight owner keeps the key.
+func resolvePromotionState(local, shared string) string {
+	switch shared {
+	case "pausing", "resuming", "killing", lifecycle.StateKilled:
+		return ""
+	}
+	if local == "" {
+		return shared
+	}
+	if shared == "" || local == shared {
+		return local
+	}
+	return lifecycle.StatePaused
+}
+
+func loadSharedStates(
+	ctx context.Context, stream *redisstream.Client, entries []registry.Entry,
+) (map[string]string, error) {
+	ids := make([]string, len(entries))
+	for i, e := range entries {
+		ids[i] = e.Meta.SandboxID
+	}
+	return stream.GetStates(ctx, ids)
+}
+
+func resolvePromotionStates(entries []registry.Entry, shared map[string]string) map[string]string {
+	out := make(map[string]string, len(entries))
+	for _, e := range entries {
+		if next := resolvePromotionState(e.RuntimeState, shared[e.Meta.SandboxID]); next != "" {
+			out[e.Meta.SandboxID] = next
+		}
+	}
+	return out
+}
+
+func snapshotPromotionStates(
+	ctx context.Context, stream *redisstream.Client, reg *registry.Registry, log *zap.Logger,
+) map[string]string {
+	entries := reg.Snapshot()
+	shared, err := loadSharedStates(ctx, stream, entries)
 	if err != nil {
-		return "", err
+		log.Warn("promotion state snapshot failed", zap.Error(err))
+		shared = map[string]string{}
 	}
-	if ok {
-		return state, nil
+	return resolvePromotionStates(entries, shared)
+}
+
+func reconcileSharedState(
+	ctx context.Context, stream *redisstream.Client, reg *registry.Registry,
+	ttl time.Duration, log *zap.Logger,
+) (map[string]string, error) {
+	entries := reg.Snapshot()
+	shared, err := loadSharedStates(ctx, stream, entries)
+	if err != nil {
+		return nil, err
 	}
-	return entry.RuntimeState, nil
+	resolved := resolvePromotionStates(entries, shared)
+	for _, e := range entries {
+		sid := e.Meta.SandboxID
+		from, next := shared[sid], resolved[sid]
+		if next == "" || next == from {
+			continue
+		}
+		updated, err := stream.WriteStateCAS(ctx, sid, from, next, ttl)
+		if err != nil {
+			log.Warn("promotion state write failed",
+				zap.String("sandbox_id", sid),
+				zap.String("from", from),
+				zap.String("to", next),
+				zap.Error(err))
+			return nil, err
+		}
+		if !updated {
+			delete(resolved, sid)
+			continue
+		}
+		reg.SetRuntimeState(sid, next)
+	}
+	return resolved, nil
 }
 
 func catchUpStreamTo(ctx context.Context, target string, stream *redisstream.Client,
@@ -663,16 +746,7 @@ func waitForRetry(ctx context.Context, delay time.Duration) bool {
 func handleEvent(ctx context.Context, ev redisstream.Event, push *proxypush.Client,
 	reg *registry.Registry, ssDeps statesync.Deps, log *zap.Logger) {
 
-	canWrite := func() bool {
-		return ssDeps.Leader == nil || ssDeps.Leader.IsLeader()
-	}
-	canDelete := func() bool {
-		p := ssDeps.Persister
-		if p == nil {
-			p = ssDeps.Leader
-		}
-		return p == nil || p.IsLeader()
-	}
+	canWrite := ssDeps.Leader == nil || ssDeps.Leader.IsLeader()
 	switch ev.Op {
 	case lifecycle.OpCreate:
 		if ev.Meta == nil {
@@ -691,7 +765,7 @@ func handleEvent(ctx context.Context, ev redisstream.Event, push *proxypush.Clie
 			zap.Bool("auto_resume", ev.Meta.AutoResume),
 			zap.Intp("timeout_seconds", ev.Meta.TimeoutSeconds),
 			zap.Int("registry_size", reg.Len()))
-		if canWrite() {
+		if canWrite {
 			if err := push.UpsertMeta(ctx, *ev.Meta); err != nil {
 				log.Warn("create event push failed",
 					zap.String("sandbox_id", ev.SandboxID), zap.Error(err))
@@ -702,11 +776,12 @@ func handleEvent(ctx context.Context, ev redisstream.Event, push *proxypush.Clie
 		log.Info("delete event applied",
 			zap.String("sandbox_id", ev.SandboxID),
 			zap.Int("registry_size", reg.Len()))
-		if canDelete() {
-			if err := push.DeleteMeta(ctx, ev.SandboxID); err != nil {
-				log.Warn("delete event push failed",
-					zap.String("sandbox_id", ev.SandboxID), zap.Error(err))
-			}
+		// Delete is terminal and sandbox IDs are not reused, so a late
+		// replica cannot invert it. Every replica pushes so a failed
+		// leader still drops the proxy entry.
+		if err := push.DeleteMeta(ctx, ev.SandboxID); err != nil {
+			log.Warn("delete event push failed",
+				zap.String("sandbox_id", ev.SandboxID), zap.Error(err))
 		}
 	case lifecycle.OpUpdate:
 		if ev.Meta == nil {
@@ -723,7 +798,7 @@ func handleEvent(ctx context.Context, ev redisstream.Event, push *proxypush.Clie
 			zap.Intp("timeout_seconds", ev.Meta.TimeoutSeconds),
 			zap.Int64("created_at_ms", ev.Meta.CreatedAt),
 			zap.Int64("end_at_ms", ev.Meta.EndAt))
-		if canWrite() {
+		if canWrite {
 			if err := push.UpsertMeta(ctx, *ev.Meta); err != nil {
 				log.Warn("update event push failed",
 					zap.String("sandbox_id", ev.SandboxID), zap.Error(err))

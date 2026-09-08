@@ -15,6 +15,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"strings"
 	"time"
 
 	"github.com/google/uuid"
@@ -27,6 +28,11 @@ import (
 const (
 	// RetCodeSuccess is CubeMaster's "operation succeeded" code.
 	RetCodeSuccess = 200
+
+	// RetCodeMasterParamsError is CubeMaster's generic params error.
+	// Pause uses it both for real Begin() failures and for "already has
+	// pause snapshot" (see pausesnap.Begin). Only the latter is a no-op.
+	RetCodeMasterParamsError = 130400
 
 	// RetCodeInvalidParamFormat is reused by CubeMaster's pause/resume path
 	// for "sandbox does not exist" — the meta lookup misses, surfaced as
@@ -73,11 +79,22 @@ func (e *APIError) IsNotFound() bool {
 	return e != nil && e.RetCode == RetCodeInvalidParamFormat
 }
 
+// alreadyHasPauseSnapshotMarker is the pausesnap.Begin message CubeMaster
+// wraps as 130400. Other 130400 Begin failures must not be treated as success.
+const alreadyHasPauseSnapshotMarker = "already has pause snapshot"
+
 // IsAlreadyInState reports whether the master refused the transition because
 // the sandbox is already in the desired state. From CLM's POV this
 // is success: the sandbox is already where we wanted it, no retry needed.
 func (e *APIError) IsAlreadyInState() bool {
-	return e != nil && e.RetCode == RetCodeTaskStateInvalid
+	if e == nil {
+		return false
+	}
+	if e.RetCode == RetCodeTaskStateInvalid {
+		return true
+	}
+	return e.RetCode == RetCodeMasterParamsError &&
+		strings.Contains(e.RetMsg, alreadyHasPauseSnapshotMarker)
 }
 
 // Client is a thin wrapper around http.Client + base URL. Concurrency-safe.

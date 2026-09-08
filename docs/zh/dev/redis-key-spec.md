@@ -63,7 +63,7 @@ cube:{ver}:{scope}:{resource}[:{sub}...]:{id}
 | 实例 metadata（预留） | `cube:v1:master:instance:meta:{...}` | string / list | master | CubeMaster | CubeMaster | 无 |
 | 沙箱 lifecycle 注册表 | `cube:v1:shared:sandbox:lifecycle:meta` | Hash | shared | CubeMaster | cube-lifecycle-manager | 无（生命周期由 `HDEL` 管理） |
 | 沙箱 lifecycle 事件流 | `cube:v1:shared:sandbox:lifecycle:events` | Stream | shared | CubeMaster | cube-lifecycle-manager | MAXLEN ~ 100000 |
-| 沙箱 lifecycle 状态 | `cube:v1:shared:sandbox:lifecycle:state:{sandboxID}` | String | shared | cube-lifecycle-manager | cube-lifecycle-manager | SET TTL（默认 60s）；state event 可编码 Stream ID 以执行单调 CAS |
+| 沙箱 lifecycle 状态 | `cube:v1:shared:sandbox:lifecycle:state:{sandboxID}` | String | shared | cube-lifecycle-manager | cube-lifecycle-manager | SET TTL（默认 60s）；纯文本状态（`paused` / `running` / 过渡标记） |
 | 沙箱 lifecycle 唤醒通知 | `cube:v1:shared:sandbox:lifecycle:notify` | Pub/Sub channel | shared | cube-lifecycle-manager | cube-lifecycle-manager | 不适用（best-effort 提示） |
 | CLM leader 租约 | `cube:v1:shared:lock:lifecycle-manager:leader` | String | shared | cube-lifecycle-manager | cube-lifecycle-manager | SET NX PX，默认 10s；续租/释放使用单 key WATCH 事务 |
 | 沙箱操作锁（pause/resume/delete） | `cube:v1:master:lock:sandbox:{sandboxID}` | String | master | CubeMaster | CubeMaster | 按操作 SET NX EX：pause **180s**，resume/delete **120s**，其它 **60s**；解锁为 token 匹配的 Lua GET+DEL（不续期） |

@@ -36,7 +36,7 @@ func TestRedisTransactionsProtectResumeOwnership(t *testing.T) {
 	}
 
 	updated, err := client.WriteStateCAS(
-		ctx, "sbx", lifecycle.StatePaused, lifecycle.StateRunning, "9-0", time.Minute,
+		ctx, "sbx", lifecycle.StatePaused, lifecycle.StateRunning, time.Minute,
 	)
 	if err != nil {
 		t.Fatal(err)
@@ -49,7 +49,7 @@ func TestRedisTransactionsProtectResumeOwnership(t *testing.T) {
 	}
 
 	updated, err = client.WriteStateCAS(
-		ctx, "sbx", "resuming", lifecycle.StateRunning, "10-0", time.Minute,
+		ctx, "sbx", "resuming", lifecycle.StateRunning, time.Minute,
 	)
 	if err != nil || !updated {
 		t.Fatalf("matching WriteStateCAS() = (%v, %v)", updated, err)
@@ -57,14 +57,30 @@ func TestRedisTransactionsProtectResumeOwnership(t *testing.T) {
 	if got, _, err := client.GetState(ctx, "sbx"); err != nil || got != lifecycle.StateRunning {
 		t.Fatalf("state = %q, want running", got)
 	}
-	if err := client.WriteState(ctx, "sbx", lifecycle.StatePaused, time.Minute); err != nil {
+}
+
+func TestGetStatesReturnsPresentKeys(t *testing.T) {
+	server := miniredis.RunT(t)
+	rdb := redis.NewClient(&redis.Options{Addr: server.Addr()})
+	t.Cleanup(func() { _ = rdb.Close() })
+	client := New(rdb, zap.NewNop())
+	ctx := context.Background()
+
+	if err := client.SetState(ctx, "a", lifecycle.StatePaused, time.Minute); err != nil {
 		t.Fatal(err)
 	}
-	updated, err = client.WriteStateCAS(
-		ctx, "sbx", lifecycle.StatePaused, lifecycle.StateRunning, "9-0", time.Minute,
-	)
-	if err != nil || updated {
-		t.Fatalf("older event WriteStateCAS() = (%v, %v), want (false, nil)", updated, err)
+	if err := client.SetState(ctx, "b", lifecycle.StateRunning, time.Minute); err != nil {
+		t.Fatal(err)
+	}
+	got, err := client.GetStates(ctx, []string{"a", "b", "missing"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got["a"] != lifecycle.StatePaused || got["b"] != lifecycle.StateRunning {
+		t.Fatalf("GetStates() = %v", got)
+	}
+	if _, ok := got["missing"]; ok {
+		t.Fatal("missing key must be omitted")
 	}
 }
 

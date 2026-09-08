@@ -55,25 +55,21 @@ type Deps struct {
 	// Now returns the current time. Injectable for tests.
 	Now func() time.Time
 
-	// Leader gates CubeProxy writes. Standbys never push the fleet.
+	// Leader gates Redis state-key writes and CubeProxy upserts. Standbys
+	// only retain the in-memory registry; promotion reconcile writes the
+	// shared key afterwards. Nil means "always write" (single-replica / tests).
 	Leader leader.Status
-	// Persister gates shared Redis state-key writes. During promotion
-	// catch-up the replica already holds the lease but is not yet an
-	// executable leader; it must still CAS the key so hydrate does not
-	// replay a stale value. Nil means "same as Leader".
-	Persister leader.Status
 }
 
-func persistEnabled(d Deps) bool {
-	p := d.Persister
-	if p == nil {
-		p = d.Leader
-	}
-	return p == nil || p.IsLeader()
-}
-
-func pushEnabled(d Deps) bool {
+func writeEnabled(d Deps) bool {
 	return d.Leader == nil || d.Leader.IsLeader()
+}
+
+func recordWarmState(d Deps, sandboxID, newState string, now func() time.Time) {
+	if newState == lifecycle.StateRunning {
+		d.Registry.MergeLastActive(sandboxID, now().UnixMilli())
+	}
+	d.Registry.SetRuntimeState(sandboxID, newState)
 }
 
 // Handle applies a single OpState event. It is intentionally best-effort:
@@ -120,16 +116,10 @@ func Handle(ctx context.Context, d Deps, ev redisstream.Event) {
 		return
 	}
 
-	recordWarmState := func() {
-		if newState == lifecycle.StateRunning {
-			d.Registry.MergeLastActive(ev.SandboxID, now().UnixMilli())
-		}
-		d.Registry.SetRuntimeState(ev.SandboxID, newState)
-	}
-	if !persistEnabled(d) {
+	if !writeEnabled(d) {
 		// Standbys consume one ordered XREAD sequence and retain the latest
 		// terminal state for promotion, but never perform external writes.
-		recordWarmState()
+		recordWarmState(d, ev.SandboxID, newState, now)
 		return
 	}
 
@@ -153,21 +143,22 @@ func Handle(ctx context.Context, d Deps, ev redisstream.Event) {
 		return
 	}
 
-	updated, err := d.Redis.WriteStateCAS(ctx, ev.SandboxID, cur, newState, ev.StreamID, d.TTL)
+	updated, err := d.Redis.WriteStateCAS(ctx, ev.SandboxID, cur, newState, d.TTL)
 	if err != nil {
 		log.Warn("state event: set state failed",
 			zap.String("sandbox_id", ev.SandboxID),
 			zap.String("new", newState), zap.Error(err))
 		return
-	} else if !updated {
+	}
+	if !updated {
 		log.Info("state event skipped: state changed concurrently",
 			zap.String("sandbox_id", ev.SandboxID),
 			zap.String("cur", cur),
 			zap.String("new", newState))
 		return
 	}
-	recordWarmState()
-	if pushEnabled(d) && d.ProxyPush != nil {
+	recordWarmState(d, ev.SandboxID, newState, now)
+	if d.ProxyPush != nil {
 		if err := d.ProxyPush.SetState(ctx, ev.SandboxID, newState); err != nil {
 			log.Warn("state event: push proxy state failed",
 				zap.String("sandbox_id", ev.SandboxID),

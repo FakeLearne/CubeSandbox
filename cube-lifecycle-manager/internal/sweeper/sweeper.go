@@ -158,21 +158,21 @@ func (s *Sweeper) sweepOnce(ctx context.Context) {
 			continue
 		}
 
-		// Already-terminal fast path: if Redis says the sandbox is parked
-		// at "paused", "pausing", "killing", or "killed", there is nothing
-		// for us to do — either the dataplane will resume it on demand
-		// (paused) or the sandbox is on its way out (killing/killed).
-		// Without this guard the sweeper logs "idle threshold exceeded"
-		// every Interval and the state-key TTL (StateLockTTL=60s) expires
-		// periodically, causing a pointless RPC churn against CubeMaster
-		// every minute.
+		// Already-terminal fast path: Redis or the in-memory RuntimeState
+		// may already say the sandbox is parked at paused/pausing/killing/
+		// killed. Redis alone is not enough — the state-key TTL
+		// (StateLockTTL=60s) expires, GetState goes empty, and idle keeps
+		// growing because LastActive is frozen after pause. Without the
+		// RuntimeState check we re-issue Pause every Interval.
+		if isParkedSweepState(e.RuntimeState) {
+			continue
+		}
 		curState, _, stateErr := s.o.Redis.GetState(ctx, e.Meta.SandboxID)
 		if stateErr != nil {
 			s.o.Log.Warn("get state failed; will attempt action anyway",
 				zap.String("sandbox_id", e.Meta.SandboxID),
 				zap.Error(stateErr))
-		} else if curState == "paused" || curState == "pausing" ||
-			curState == "killing" || curState == "killed" {
+		} else if isParkedSweepState(curState) {
 			// Nothing to do. "pausing" / "killing" mean a peer (or our own
 			// previous invocation) is mid-flight; let it finish.
 			continue
@@ -419,4 +419,13 @@ func (s *Sweeper) tryKill(ctx context.Context, e registry.Entry) error {
 		zap.Intp("timeout_seconds", e.Meta.TimeoutSeconds),
 		zap.String("kill_reason", cubemasterclient.KillReasonTimeout))
 	return nil
+}
+
+func isParkedSweepState(state string) bool {
+	switch state {
+	case lifecycle.StatePaused, "pausing", "killing", lifecycle.StateKilled:
+		return true
+	default:
+		return false
+	}
 }

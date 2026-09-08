@@ -31,11 +31,6 @@ type standbyStatus struct{}
 func (standbyStatus) IsLeader() bool { return false }
 func (standbyStatus) Enabled() bool  { return true }
 
-type persistStatus struct{}
-
-func (persistStatus) IsLeader() bool { return true }
-func (persistStatus) Enabled() bool  { return true }
-
 func TestCatchUpStreamToDrainsPromotionHighWater(t *testing.T) {
 	server := miniredis.RunT(t)
 	rdb := redis.NewClient(&redis.Options{Addr: server.Addr()})
@@ -84,7 +79,7 @@ func TestCatchUpStreamToDrainsPromotionHighWater(t *testing.T) {
 	}
 }
 
-func TestCatchUpStateEventPersistsSharedKeyWithoutProxyPush(t *testing.T) {
+func TestCatchUpStateEventKeepsWarmStateWithoutWritingRedis(t *testing.T) {
 	server := miniredis.RunT(t)
 	rdb := redis.NewClient(&redis.Options{Addr: server.Addr()})
 	t.Cleanup(func() { _ = rdb.Close() })
@@ -119,21 +114,22 @@ func TestCatchUpStateEventPersistsSharedKeyWithoutProxyPush(t *testing.T) {
 	reg.SetRuntimeState("sbx", lifecycle.StatePaused)
 	progress := newStreamProgress("0-0")
 	deps := statesync.Deps{
-		Registry:  reg,
-		Redis:     stream,
-		TTL:       time.Minute,
-		Leader:    standbyStatus{},
-		Persister: persistStatus{},
-		Log:       zap.NewNop(),
+		Registry: reg,
+		Redis:    stream,
+		TTL:      time.Minute,
+		Leader:   standbyStatus{},
+		Log:      zap.NewNop(),
 	}
 	push := proxypush.New(nil, "", time.Second, zap.NewNop())
 
 	if err := catchUpStreamTo(ctx, "10-0", stream, push, reg, deps, progress, zap.NewNop()); err != nil {
 		t.Fatal(err)
 	}
-	state, err := resolvePromotionState(ctx, stream, *reg.Get("sbx"))
-	if err != nil || state != lifecycle.StateRunning {
-		t.Fatalf("resolvePromotionState() = (%q, %v), want running", state, err)
+	if got := reg.Get("sbx").RuntimeState; got != lifecycle.StateRunning {
+		t.Fatalf("RuntimeState = %q, want running", got)
+	}
+	if got, _, err := stream.GetState(ctx, "sbx"); err != nil || got != lifecycle.StatePaused {
+		t.Fatalf("standby catch-up wrote Redis state %q, want paused", got)
 	}
 }
 
@@ -163,69 +159,49 @@ func deleteRecorder(t *testing.T) (adminURL string, deleted func() []string) {
 	}
 }
 
-// A delete event always drops the sandbox from the local registry, but only the
-// lease holder may push the delete to CubeProxy. The push is gated on the lease
-// rather than on executable leadership so a promoting replica still propagates
-// deletes during its catch-up drain — nothing can replay them afterwards, since
-// hydration only iterates entries still present in the registry.
-func TestCatchUpDeleteEventPushesProxyOnlyForLeaseHolder(t *testing.T) {
-	cases := []struct {
-		name      string
-		persister leader.Status
-		wantPush  bool
-	}{
-		{"lease holder pushes", persistStatus{}, true},
-		{"standby does not push", standbyStatus{}, false},
+// A delete event always drops the sandbox from the local registry and every
+// replica pushes DeleteMeta: the op is terminal and sandbox IDs are not reused.
+func TestCatchUpDeleteEventPushesProxyFromAllReplicas(t *testing.T) {
+	server := miniredis.RunT(t)
+	rdb := redis.NewClient(&redis.Options{Addr: server.Addr()})
+	t.Cleanup(func() { _ = rdb.Close() })
+	ctx := context.Background()
+	stream := redisstream.New(rdb, zap.NewNop())
+	adminURL, deleted := deleteRecorder(t)
+
+	if err := rdb.XAdd(ctx, &redis.XAddArgs{
+		Stream: lifecycle.EventStreamKey,
+		ID:     "10-0",
+		Values: map[string]interface{}{
+			lifecycle.FieldOp:        lifecycle.OpDelete,
+			lifecycle.FieldSandboxID: "sbx-del",
+			lifecycle.FieldTimestamp: time.Now().UnixMilli(),
+		},
+	}).Err(); err != nil {
+		t.Fatal(err)
 	}
-	for _, tc := range cases {
-		t.Run(tc.name, func(t *testing.T) {
-			server := miniredis.RunT(t)
-			rdb := redis.NewClient(&redis.Options{Addr: server.Addr()})
-			t.Cleanup(func() { _ = rdb.Close() })
-			ctx := context.Background()
-			stream := redisstream.New(rdb, zap.NewNop())
-			adminURL, deleted := deleteRecorder(t)
 
-			if err := rdb.XAdd(ctx, &redis.XAddArgs{
-				Stream: lifecycle.EventStreamKey,
-				ID:     "10-0",
-				Values: map[string]interface{}{
-					lifecycle.FieldOp:        lifecycle.OpDelete,
-					lifecycle.FieldSandboxID: "sbx-del",
-					lifecycle.FieldTimestamp: time.Now().UnixMilli(),
-				},
-			}).Err(); err != nil {
-				t.Fatal(err)
-			}
+	reg := registry.New()
+	reg.Upsert(lifecycle.SandboxLifecycleMeta{SandboxID: "sbx-del"})
+	deps := statesync.Deps{
+		Registry: reg,
+		Redis:    stream,
+		Leader:   standbyStatus{},
+		Log:      zap.NewNop(),
+	}
+	push := proxypush.New([]string{adminURL}, "", time.Second, zap.NewNop())
 
-			reg := registry.New()
-			reg.Upsert(lifecycle.SandboxLifecycleMeta{SandboxID: "sbx-del"})
-			deps := statesync.Deps{
-				Registry:  reg,
-				Redis:     stream,
-				Leader:    standbyStatus{},
-				Persister: tc.persister,
-				Log:       zap.NewNop(),
-			}
-			push := proxypush.New([]string{adminURL}, "", time.Second, zap.NewNop())
-
-			if err := catchUpStreamTo(
-				ctx, "10-0", stream, push, reg, deps, newStreamProgress("0-0"), zap.NewNop(),
-			); err != nil {
-				t.Fatal(err)
-			}
-			if reg.Get("sbx-del") != nil {
-				t.Fatal("registry entry should have been deleted")
-			}
-			got := deleted()
-			if tc.wantPush {
-				if len(got) != 1 || got[0] != "sbx-del" {
-					t.Fatalf("lease holder must push DeleteMeta, got %v", got)
-				}
-			} else if len(got) != 0 {
-				t.Fatalf("standby must not push DeleteMeta, got %v", got)
-			}
-		})
+	if err := catchUpStreamTo(
+		ctx, "10-0", stream, push, reg, deps, newStreamProgress("0-0"), zap.NewNop(),
+	); err != nil {
+		t.Fatal(err)
+	}
+	if reg.Get("sbx-del") != nil {
+		t.Fatal("registry entry should have been deleted")
+	}
+	got := deleted()
+	if len(got) != 1 || got[0] != "sbx-del" {
+		t.Fatalf("standby must push DeleteMeta, got %v", got)
 	}
 }
 
@@ -240,31 +216,133 @@ func TestStreamProgressRejectsPrefetchedOlderBatch(t *testing.T) {
 	}
 }
 
-func TestResolvePromotionStatePrefersSharedRedis(t *testing.T) {
+func TestResolvePromotionState(t *testing.T) {
+	cases := []struct {
+		name   string
+		local  string
+		shared string
+		want   string
+	}{
+		{"both empty", "", "", ""},
+		{"local only", lifecycle.StatePaused, "", lifecycle.StatePaused},
+		{"shared only", "", lifecycle.StateRunning, lifecycle.StateRunning},
+		{"agree running", lifecycle.StateRunning, lifecycle.StateRunning, lifecycle.StateRunning},
+		{"agree paused", lifecycle.StatePaused, lifecycle.StatePaused, lifecycle.StatePaused},
+		{"disagree prefers paused", lifecycle.StatePaused, lifecycle.StateRunning, lifecycle.StatePaused},
+		{"disagree running local", lifecycle.StateRunning, lifecycle.StatePaused, lifecycle.StatePaused},
+		{"skip pausing", lifecycle.StatePaused, "pausing", ""},
+		{"skip resuming", lifecycle.StateRunning, "resuming", ""},
+		{"skip killing", lifecycle.StatePaused, "killing", ""},
+		{"skip killed", lifecycle.StateRunning, lifecycle.StateKilled, ""},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := resolvePromotionState(tc.local, tc.shared); got != tc.want {
+				t.Fatalf("resolvePromotionState(%q, %q) = %q, want %q",
+					tc.local, tc.shared, got, tc.want)
+			}
+		})
+	}
+}
+
+func TestReconcileSharedStateWritesStaleRunningToPaused(t *testing.T) {
 	server := miniredis.RunT(t)
 	rdb := redis.NewClient(&redis.Options{Addr: server.Addr()})
 	t.Cleanup(func() { _ = rdb.Close() })
-	stream := redisstream.New(rdb, zap.NewNop())
 	ctx := context.Background()
-	entry := registry.Entry{
-		Meta:         lifecycle.SandboxLifecycleMeta{SandboxID: "sbx"},
-		RuntimeState: lifecycle.StatePaused,
-	}
-
+	stream := redisstream.New(rdb, zap.NewNop())
+	reg := registry.New()
+	reg.Upsert(lifecycle.SandboxLifecycleMeta{SandboxID: "sbx"})
+	reg.SetRuntimeState("sbx", lifecycle.StatePaused)
 	if err := stream.SetState(ctx, "sbx", lifecycle.StateRunning, time.Minute); err != nil {
 		t.Fatal(err)
 	}
-	state, err := resolvePromotionState(ctx, stream, entry)
-	if err != nil || state != lifecycle.StateRunning {
-		t.Fatalf("resolvePromotionState() = (%q, %v), want running", state, err)
-	}
 
-	if err := stream.ClearState(ctx, "sbx"); err != nil {
+	got, err := reconcileSharedState(ctx, stream, reg, time.Minute, zap.NewNop())
+	if err != nil {
 		t.Fatal(err)
 	}
-	state, err = resolvePromotionState(ctx, stream, entry)
-	if err != nil || state != lifecycle.StatePaused {
-		t.Fatalf("fallback resolvePromotionState() = (%q, %v), want paused", state, err)
+	if got["sbx"] != lifecycle.StatePaused {
+		t.Fatalf("resolved = %q, want paused", got["sbx"])
+	}
+	if state, _, err := stream.GetState(ctx, "sbx"); err != nil || state != lifecycle.StatePaused {
+		t.Fatalf("redis state = %q, want paused", state)
+	}
+}
+
+func TestReconcileSharedStateSkipsTransitionMarker(t *testing.T) {
+	server := miniredis.RunT(t)
+	rdb := redis.NewClient(&redis.Options{Addr: server.Addr()})
+	t.Cleanup(func() { _ = rdb.Close() })
+	ctx := context.Background()
+	stream := redisstream.New(rdb, zap.NewNop())
+	reg := registry.New()
+	reg.Upsert(lifecycle.SandboxLifecycleMeta{SandboxID: "sbx"})
+	reg.SetRuntimeState("sbx", lifecycle.StateRunning)
+	if err := stream.SetState(ctx, "sbx", "resuming", time.Minute); err != nil {
+		t.Fatal(err)
+	}
+
+	got, err := reconcileSharedState(ctx, stream, reg, time.Minute, zap.NewNop())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := got["sbx"]; ok {
+		t.Fatalf("transition marker must be skipped, got %v", got)
+	}
+	if state, _, err := stream.GetState(ctx, "sbx"); err != nil || state != "resuming" {
+		t.Fatalf("redis state = %q, want resuming", state)
+	}
+}
+
+// mgetFlipHook rewrites a Redis key after MGET so WriteStateCAS sees a
+// concurrent resume and must not overwrite it.
+type mgetFlipHook struct {
+	mini *miniredis.Miniredis
+	key  string
+	val  string
+	once sync.Once
+}
+
+func (h *mgetFlipHook) DialHook(next redis.DialHook) redis.DialHook { return next }
+
+func (h *mgetFlipHook) ProcessHook(next redis.ProcessHook) redis.ProcessHook {
+	return func(ctx context.Context, cmd redis.Cmder) error {
+		err := next(ctx, cmd)
+		if cmd.Name() == "mget" {
+			h.once.Do(func() { _ = h.mini.Set(h.key, h.val) })
+		}
+		return err
+	}
+}
+
+func (h *mgetFlipHook) ProcessPipelineHook(next redis.ProcessPipelineHook) redis.ProcessPipelineHook {
+	return next
+}
+
+func TestReconcileSharedStateCASMismatchLeavesRedis(t *testing.T) {
+	server := miniredis.RunT(t)
+	rdb := redis.NewClient(&redis.Options{Addr: server.Addr()})
+	rdb.AddHook(&mgetFlipHook{mini: server, key: lifecycle.StateKey("sbx"), val: "resuming"})
+	t.Cleanup(func() { _ = rdb.Close() })
+	ctx := context.Background()
+	stream := redisstream.New(rdb, zap.NewNop())
+	reg := registry.New()
+	reg.Upsert(lifecycle.SandboxLifecycleMeta{SandboxID: "sbx"})
+	reg.SetRuntimeState("sbx", lifecycle.StatePaused)
+	if err := stream.SetState(ctx, "sbx", lifecycle.StateRunning, time.Minute); err != nil {
+		t.Fatal(err)
+	}
+
+	got, err := reconcileSharedState(ctx, stream, reg, time.Minute, zap.NewNop())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := got["sbx"]; ok {
+		t.Fatalf("CAS mismatch must drop sid, got %v", got)
+	}
+	if state, _, err := stream.GetState(ctx, "sbx"); err != nil || state != "resuming" {
+		t.Fatalf("redis state = %q, want resuming", state)
 	}
 }
 
@@ -360,17 +438,14 @@ func TestReplayRegistryToPushesPausedState(t *testing.T) {
 	}))
 	t.Cleanup(ts.Close)
 
-	server := miniredis.RunT(t)
-	rdb := redis.NewClient(&redis.Options{Addr: server.Addr()})
-	t.Cleanup(func() { _ = rdb.Close() })
-	stream := redisstream.New(rdb, zap.NewNop())
 	reg := registry.New()
 	reg.Upsert(lifecycle.SandboxLifecycleMeta{SandboxID: "sbx"})
 	reg.SetRuntimeState("sbx", lifecycle.StatePaused)
 	push := proxypush.New([]string{ts.URL}, "", time.Second, zap.NewNop())
 	ep := discovery.Endpoint{ProxyID: "p", AdminURL: ts.URL}
 
-	if !replayRegistryTo(context.Background(), push, stream, reg, ep, zap.NewNop()) {
+	resolved := map[string]string{"sbx": lifecycle.StatePaused}
+	if !replayRegistryTo(context.Background(), push, resolved, reg, ep, zap.NewNop()) {
 		t.Fatal("replayRegistryTo failed")
 	}
 	mu.Lock()
@@ -378,6 +453,40 @@ func TestReplayRegistryToPushesPausedState(t *testing.T) {
 	if len(paths) != 2 || paths[0] != "/admin/meta/upsert" || paths[1] != "/admin/state" {
 		t.Fatalf("paths = %v, want [upsert, state]", paths)
 	}
+	if len(states) != 1 || states[0] != lifecycle.StatePaused {
+		t.Fatalf("states = %v, want [paused]", states)
+	}
+}
+
+func TestReplayRegistryToReresolvesLivePausedOverStaleRunning(t *testing.T) {
+	var mu sync.Mutex
+	var states []string
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		if r.URL.Path == "/admin/state" {
+			var payload map[string]string
+			_ = json.Unmarshal(body, &payload)
+			mu.Lock()
+			states = append(states, payload["state"])
+			mu.Unlock()
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"ok":true}`))
+	}))
+	t.Cleanup(ts.Close)
+
+	reg := registry.New()
+	reg.Upsert(lifecycle.SandboxLifecycleMeta{SandboxID: "sbx"})
+	reg.SetRuntimeState("sbx", lifecycle.StatePaused)
+	push := proxypush.New([]string{ts.URL}, "", time.Second, zap.NewNop())
+	ep := discovery.Endpoint{ProxyID: "p", AdminURL: ts.URL}
+
+	stale := map[string]string{"sbx": lifecycle.StateRunning}
+	if !replayRegistryTo(context.Background(), push, stale, reg, ep, zap.NewNop()) {
+		t.Fatal("replayRegistryTo failed")
+	}
+	mu.Lock()
+	defer mu.Unlock()
 	if len(states) != 1 || states[0] != lifecycle.StatePaused {
 		t.Fatalf("states = %v, want [paused]", states)
 	}
@@ -431,7 +540,7 @@ func TestReconcileOnLeadershipDoesNotWaitForFleetHTTP(t *testing.T) {
 	go func() {
 		_ = reconcileOnLeadership(
 			ctx, lease, active, stream, push, reg, fleet, deps, progress, &mu,
-			10*time.Millisecond, 0, zap.NewNop(),
+			10*time.Millisecond, 0, time.Minute, zap.NewNop(),
 		)
 	}()
 
@@ -495,7 +604,7 @@ func TestInvalidateKeepsGenerationAndSkipsHTTPDrain(t *testing.T) {
 	go func() {
 		_ = reconcileOnLeadership(
 			ctx, lease, active, stream, push, reg, fleet, deps, progress, &mu,
-			10*time.Millisecond, time.Hour, zap.NewNop(),
+			10*time.Millisecond, time.Hour, time.Minute, zap.NewNop(),
 		)
 	}()
 
@@ -525,7 +634,7 @@ func TestFirstGenerationStillDrainsBeforeBecomingExecutable(t *testing.T) {
 	go func() {
 		_ = reconcileOnLeadership(
 			ctx, lease, active, stream, push, reg, fleet, deps, progress, &mu,
-			10*time.Millisecond, time.Hour, zap.NewNop(),
+			10*time.Millisecond, time.Hour, time.Minute, zap.NewNop(),
 		)
 	}()
 

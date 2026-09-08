@@ -199,12 +199,30 @@
 {{- end }}
 {{- if eq (include "cube.lifecycleManagerEnabled" .) "true" }}
 {{- $leaderElection := .Values.lifecycleManager.leaderElection | default dict -}}
-{{- if $leaderElection.enabled }}
-{{- if lt (int .Values.lifecycleManager.replicas) 2 }}
-{{- fail "lifecycleManager.leaderElection.enabled=true requires lifecycleManager.replicas>=2" }}
+{{- if and (hasKey $leaderElection "enabled") (not (kindIs "bool" $leaderElection.enabled)) }}
+{{- fail "lifecycleManager.leaderElection.enabled must be a boolean" }}
 {{- end }}
+{{- if and (ge (int .Values.lifecycleManager.replicas) 2) (ne (printf "%v" $leaderElection.enabled) "true") }}
+{{- fail "lifecycleManager.replicas>=2 requires lifecycleManager.leaderElection.enabled=true" }}
+{{- end }}
+{{- if $leaderElection.enabled }}
 {{- if or (empty $leaderElection.leaseTTL) (empty $leaderElection.renewInterval) (empty $leaderElection.retryInterval) }}
 {{- fail "lifecycleManager.leaderElection.enabled=true requires leaseTTL, renewInterval, and retryInterval" }}
+{{- end }}
+{{- $renew := $leaderElection.renewInterval | toString -}}
+{{- $lease := $leaderElection.leaseTTL | toString -}}
+{{- $retry := $leaderElection.retryInterval | toString -}}
+{{- if or (not (regexMatch `^[0-9]+s$` $renew)) (not (regexMatch `^[0-9]+s$` $lease)) (not (regexMatch `^[0-9]+s$` $retry)) }}
+{{- fail "lifecycleManager.leaderElection.leaseTTL, renewInterval, and retryInterval must be integer seconds (e.g. 10s)" }}
+{{- end }}
+{{- $renewSec := trimSuffix "s" $renew | int -}}
+{{- $leaseSec := trimSuffix "s" $lease | int -}}
+{{- $retrySec := trimSuffix "s" $retry | int -}}
+{{- if ge (mul $renewSec 2) $leaseSec }}
+{{- fail "lifecycleManager.leaderElection.renewInterval must be less than half of leaseTTL" }}
+{{- end }}
+{{- if ge $retrySec $leaseSec }}
+{{- fail "lifecycleManager.leaderElection.retryInterval must be less than leaseTTL" }}
 {{- end }}
 {{- end }}
 {{- if not (include "cube.masterEndpoint" .) }}

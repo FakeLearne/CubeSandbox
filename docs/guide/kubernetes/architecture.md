@@ -193,6 +193,12 @@ Guest kernel selection: first check `effective-pvm`; if missing, try to keep the
 
 CubeProxy forwards to the target compute-node sandbox via owner metadata in Redis.
 
+### 2.5 cube-lifecycle-manager HA
+
+The chart defaults to `lifecycleManager.replicas=2` with `leaderElection.enabled=true`, running active-standby: every replica consumes lifecycle events and serves resume callbacks, while a Redis lease elects one leader to run the idle sweep/kill and stale-registry pruning. Only the leader writes shared sandbox state. Setting `replicas` above 1 with leader election disabled fails Helm validation. Terraform one-click defaults to the same two-replica active-standby layout.
+
+On leader failover the new leader recovers shared state conservatively: where the state records disagree, it records the safe answer, `paused`, and the sandbox auto-resumes on its next request. See the [FAQ](faq.md) for the user-visible effect.
+
 ## 3. DNS
 
 The Chart **does not** deploy its own CoreDNS. When Proxy is enabled and `configureClusterDNS=true` (default):

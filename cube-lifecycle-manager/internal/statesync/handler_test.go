@@ -60,7 +60,7 @@ func (f *fakeRedis) WriteState(ctx context.Context, sid, state string, ttl time.
 }
 
 func (f *fakeRedis) WriteStateCAS(
-	_ context.Context, sid, expected, state, _ string, _ time.Duration,
+	_ context.Context, sid, expected, state string, _ time.Duration,
 ) (bool, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -171,14 +171,14 @@ func TestHandle_RunningToPaused(t *testing.T) {
 	}
 }
 
-func TestHandle_SameStateRecordsEventVersion(t *testing.T) {
+func TestHandle_SameStateStillConvergesProxy(t *testing.T) {
 	d, r, p, _ := buildDeps(t)
 	r.states["sbx-1"] = "paused"
 
 	Handle(context.Background(), d, stateEvent("sbx-1", lifecycle.StatePaused, lifecycle.ActorCubeMaster))
 
 	if r.setCalls != 1 {
-		t.Fatalf("same-state event must record its version: %d", r.setCalls)
+		t.Fatalf("same-state event must still CAS: %d", r.setCalls)
 	}
 	if got := p.recorded(); len(got) != 1 {
 		t.Fatalf("same-state event should converge proxy once: %+v", got)
@@ -284,26 +284,7 @@ func TestHandle_StandbyRetainsWarmStateWithoutExternalWrites(t *testing.T) {
 	}
 }
 
-func TestHandle_LeaseHolderPersistsWithoutPushingProxy(t *testing.T) {
-	d, r, p, reg := buildDeps(t)
-	d.Leader = fakeLeader{leader: false}
-	d.Persister = fakeLeader{leader: true}
-	r.states["sbx-1"] = lifecycle.StatePaused
-
-	Handle(context.Background(), d, stateEvent("sbx-1", lifecycle.StateRunning, lifecycle.ActorCubeMaster))
-
-	if got := r.states["sbx-1"]; got != lifecycle.StateRunning {
-		t.Fatalf("lease holder Redis state = %q, want running", got)
-	}
-	if got := p.recorded(); len(got) != 0 {
-		t.Fatalf("promotion catch-up must not push CubeProxy: %+v", got)
-	}
-	if got := reg.Get("sbx-1").RuntimeState; got != lifecycle.StateRunning {
-		t.Fatalf("RuntimeState = %q, want running", got)
-	}
-}
-
-func TestHandle_RejectedOldEventDoesNotRollBackWarmState(t *testing.T) {
+func TestHandle_RejectedCASDoesNotRollBackWarmState(t *testing.T) {
 	d, r, p, reg := buildDeps(t)
 	r.states["sbx-1"] = lifecycle.StateRunning
 	reg.SetRuntimeState("sbx-1", lifecycle.StateRunning)

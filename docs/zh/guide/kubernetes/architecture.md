@@ -193,6 +193,12 @@ Guest 选核：先看 `effective-pvm`；没有则尽量保持节点上一次已�
 
 CubeProxy 经 Redis 中的 owner 元数据转发到目标 compute 节点 sandbox。
 
+### 2.5 cube-lifecycle-manager 高可用
+
+chart 默认 `lifecycleManager.replicas=2` 且 `leaderElection.enabled=true`，以主备方式运行：每个副本都消费生命周期事件、处理恢复回调，由 Redis 租约选出的 leader 执行空闲扫描/销毁和过期注册清理；共享的沙箱状态只有 leader 会写。`replicas` 大于 1 却关闭选主会在 Helm 校验阶段失败。Terraform 一键部署默认同样是双副本主备。
+
+leader 故障切换后，新 leader 按保守策略恢复共享状态：状态记录不一致的沙箱按安全的一侧记为 `paused`，下次请求照常 auto-resume。用户可见的影响见 [FAQ](faq.md)。
+
 ## 3. DNS
 
 Chart **不**部署自有 CoreDNS。Proxy 启用且 `configureClusterDNS=true`（默认）时：

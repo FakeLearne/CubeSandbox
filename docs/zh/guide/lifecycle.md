@@ -220,7 +220,7 @@ python examples/code-sandbox-quickstart/auto-kill.py
 同一段里的 `create_timeout_insec` 与空闲 TTL 无关，仅限制创建/调度 RPC 的截止时间。更多 CubeMaster 配置项见[服务管理 — CubeMaster 配置项](service-management.md#cubemaster-settings)。
 
 - **暂停的状态保真度**：CPU 寄存器、进程内存、TCP 连接（无外部对端）、文件系统改动都会随快照保留；面向外部的连接（如 sandbox 主动建立的 outbound socket）会在暂停时断开，恢复后由应用层自行重连。
-- **集群一致性**：自动暂停由 `cube-lifecycle-manager` 协调。Kubernetes 默认运行两个温备副本：两个副本都消费生命周期事件、发现 CubeProxy 并处理恢复回调，由 Redis 租约选出一个副本执行空闲扫描、销毁和过期注册清理。每沙箱 Redis 状态转换与 CubeMaster lifecycle lock 共同串行化跨副本的有效暂停/恢复操作。
+- **集群一致性**：自动暂停由 `cube-lifecycle-manager` 协调。Helm chart 与 Terraform 一键部署默认都是两个温备副本。两个副本都消费生命周期事件、发现 CubeProxy 并处理恢复回调，由 Redis 租约选出一个副本执行空闲扫描、销毁和过期注册清理。leader 故障切换后沙箱可能多一次 pause/resume，下次请求会照常 auto-resume（见 [Kubernetes FAQ](kubernetes/faq.md)）。每沙箱 Redis 状态转换与 CubeMaster lifecycle lock 共同串行化跨副本的有效暂停/恢复操作。
 - **失败回退**：自动恢复 RPC 失败时，CubeProxy 直接对客户端返回 503 + `Retry-After`，不会让用户卡在长超时上；当沙箱已经被销毁（`killing` / `killed`），则返回 410 Gone 让客户端立即停止重试。
 - **故障排查**：控制节点上执行 `docker logs cube-lifecycle-manager` 查看运行日志，关键事件包括 `create event applied`、`auto-paused sandbox`、`auto-resumed sandbox`、`timeout-killed sandbox`。每个 CubeProxy 副本额外提供 `GET http://<node-ip>:8082/admin/healthz`，其中 `heartbeat_last_pushed_ms` 表示该副本最近一次向 manager 上报心跳的时间戳。管理端口默认为 `8082`；由于 CubeProxy 使用主机网络，当该端口已被占用时可通过 `CUBE_PROXY_ADMIN_PORT` 覆盖。
 

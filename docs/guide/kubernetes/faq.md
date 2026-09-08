@@ -144,6 +144,10 @@ kubectl uncordon <node>
 
 ## Control plane / database
 
+### After CLM failover a sandbox pauses or resumes once more
+
+This is expected, and it happens once — not in a loop. When a new leader takes over (a replica failure, or the leader switch during a rolling upgrade), it re-checks each sandbox's state; where the records disagree it records the safe answer, `paused`. This is bookkeeping only — no pause is sent to the VM — and the next request auto-resumes the sandbox as usual. The cost is one extra auto-resume; the alternative, recording `running` for a sandbox that is actually stopped, would route traffic to a stopped VM.
+
 ### cube-master cannot connect to MySQL
 
 Check in order (commands below assume Release `cube`, namespace `cube-system`; for other Release names, replace the resource name prefix with `<release>`):

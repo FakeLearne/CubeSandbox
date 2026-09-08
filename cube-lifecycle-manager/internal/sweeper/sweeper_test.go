@@ -772,6 +772,104 @@ func TestSweeper_NilTimeoutFallsBackToDefaultIdle(t *testing.T) {
 	}
 }
 
+func TestSweeper_SkipsWhenRuntimeStatePausedAndRedisEmpty(t *testing.T) {
+	// After a successful pause the Redis key expires (StateLockTTL) while
+	// the in-memory RuntimeState stays paused. Idle keeps growing. Without
+	// the RuntimeState guard we would Pause CubeMaster every Interval.
+	reg := registry.New()
+	store := newFakeStore()
+	master := &fakeMaster{}
+	push := newFakePush()
+
+	now := time.Now()
+	seedEntry(t, reg, lifecycle.SandboxLifecycleMeta{
+		SandboxID: "sbx-mem", InstanceType: "cubebox",
+		AutoPause: true, TimeoutSeconds: lifecycle.TimeoutSecondsPtr(60),
+	}, now.Add(-1*time.Hour).UnixMilli())
+	if !reg.SetRuntimeState("sbx-mem", lifecycle.StatePaused) {
+		t.Fatal("SetRuntimeState")
+	}
+
+	s := newTestSweeper(reg, store, master, push, now)
+	s.sweepOnce(context.Background())
+
+	if len(master.calls) != 0 {
+		t.Fatalf("sweeper must NOT call Pause when RuntimeState is paused: %v", master.calls)
+	}
+}
+
+func TestSweeper_AlreadyHasPauseSnapshotReconcilesAsSuccess(t *testing.T) {
+	reg := registry.New()
+	store := newFakeStore()
+	master := &fakeMaster{
+		failNext: true,
+		failError: &cubemasterclient.APIError{
+			RetCode: cubemasterclient.RetCodeMasterParamsError,
+			RetMsg:  "begin pause snapshot: sandbox sbx-snap already has pause snapshot snap-1",
+		},
+	}
+	push := newFakePush()
+
+	now := time.Now()
+	seedEntry(t, reg, lifecycle.SandboxLifecycleMeta{
+		SandboxID: "sbx-snap", InstanceType: "cubebox",
+		AutoPause: true, TimeoutSeconds: lifecycle.TimeoutSecondsPtr(60),
+	}, now.Add(-10*time.Minute).UnixMilli())
+
+	s := newTestSweeper(reg, store, master, push, now)
+	s.sweepOnce(context.Background())
+
+	if got := store.state("sbx-snap"); got != "paused" {
+		t.Fatalf("expected redis state=paused (reconciliation), got %q", got)
+	}
+	if got := reg.Get("sbx-snap").RuntimeState; got != lifecycle.StatePaused {
+		t.Fatalf("RuntimeState = %q, want paused", got)
+	}
+	pushed := push.states("sbx-snap")
+	if len(pushed) == 0 || pushed[len(pushed)-1] != "paused" {
+		t.Fatalf("expected last push state=paused, got %v", pushed)
+	}
+	triggered, failed := s.Stats()
+	if triggered != 1 || failed != 0 {
+		t.Fatalf("already-has-snapshot should count as triggered, not failed: triggered=%d failed=%d",
+			triggered, failed)
+	}
+}
+
+func TestSweeper_OtherMasterParamsErrorStillFails(t *testing.T) {
+	reg := registry.New()
+	store := newFakeStore()
+	master := &fakeMaster{
+		failNext: true,
+		failError: &cubemasterclient.APIError{
+			RetCode: cubemasterclient.RetCodeMasterParamsError,
+			RetMsg:  "begin pause snapshot: sandboxID is required",
+		},
+	}
+	push := newFakePush()
+
+	now := time.Now()
+	seedEntry(t, reg, lifecycle.SandboxLifecycleMeta{
+		SandboxID: "sbx-bad", InstanceType: "cubebox",
+		AutoPause: true, TimeoutSeconds: lifecycle.TimeoutSecondsPtr(60),
+	}, now.Add(-10*time.Minute).UnixMilli())
+
+	s := newTestSweeper(reg, store, master, push, now)
+	s.sweepOnce(context.Background())
+
+	if got := store.state("sbx-bad"); got != "" {
+		t.Fatalf("unrelated 130400 must not leave paused, got %q", got)
+	}
+	pushed := push.states("sbx-bad")
+	if len(pushed) == 0 || pushed[len(pushed)-1] != "running" {
+		t.Fatalf("unrelated 130400 should roll back to running, got %v", pushed)
+	}
+	_, failed := s.Stats()
+	if failed != 1 {
+		t.Fatalf("unrelated 130400 should count as failed, got failed=%d", failed)
+	}
+}
+
 func TestSweeper_AlreadyPausedReconcilesAsSuccess(t *testing.T) {
 	// CubeMaster returns "sandbox is already paused" (RetCodeTaskStateInvalid)
 	// when a peer CLM replica already paused this sandbox. The sweeper should NOT
