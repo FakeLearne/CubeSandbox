@@ -908,11 +908,18 @@ setup_env() {
 	export TF_VAR_cube_api_replicas="${TENCENTCLOUD_CUBE_API_REPLICAS:-1}"
 	export TF_VAR_cube_ops_replicas="${TENCENTCLOUD_CUBE_OPS_REPLICAS:-2}"
 	export TF_VAR_cube_proxy_replicas="${TENCENTCLOUD_CUBE_PROXY_REPLICAS:-1}"
-	export TF_VAR_cube_lifecycle_manager_replicas="${TENCENTCLOUD_CUBE_LIFECYCLE_MANAGER_REPLICAS:-1}"
+	export TF_VAR_cube_lifecycle_manager_replicas="${TENCENTCLOUD_CUBE_LIFECYCLE_MANAGER_REPLICAS:-2}"
 	export TF_VAR_cube_webui_replicas="${TENCENTCLOUD_CUBE_WEBUI_REPLICAS:-1}"
 	export TF_VAR_cube_lifecycle_manager_default_idle_timeout="${TENCENTCLOUD_CUBE_LIFECYCLE_MANAGER_DEFAULT_IDLE_TIMEOUT:-5m}"
 	export TF_VAR_cube_lifecycle_manager_heartbeat_ttl="${TENCENTCLOUD_CUBE_LIFECYCLE_MANAGER_HEARTBEAT_TTL:-15s}"
 	export TF_VAR_cube_lifecycle_manager_discovery_refresh="${TENCENTCLOUD_CUBE_LIFECYCLE_MANAGER_DISCOVERY_REFRESH:-3s}"
+	# CLM active-standby. Election must stay in step with the replica count:
+	# 2 replicas without it means two uncoordinated actors, not HA. tke-addons.tf
+	# has preconditions on both directions.
+	export TF_VAR_cube_lifecycle_manager_leader_election_enabled="${TENCENTCLOUD_CUBE_LIFECYCLE_MANAGER_LEADER_ELECTION_ENABLED:-true}"
+	export TF_VAR_cube_lifecycle_manager_leader_lease_ttl="${TENCENTCLOUD_CUBE_LIFECYCLE_MANAGER_LEADER_LEASE_TTL:-10s}"
+	export TF_VAR_cube_lifecycle_manager_leader_renew_interval="${TENCENTCLOUD_CUBE_LIFECYCLE_MANAGER_LEADER_RENEW_INTERVAL:-3s}"
+	export TF_VAR_cube_lifecycle_manager_leader_retry_interval="${TENCENTCLOUD_CUBE_LIFECYCLE_MANAGER_LEADER_RETRY_INTERVAL:-1s}"
 	export TF_VAR_cube_admin_token="${TENCENTCLOUD_CUBE_ADMIN_TOKEN:-}"
 	export TF_VAR_cube_proxy_heartbeat_interval_ms="${TENCENTCLOUD_CUBE_PROXY_HEARTBEAT_INTERVAL_MS:-5000}"
 	# cube-proxy admin port (host-network admin listener, auto-pause coordination).
@@ -4387,11 +4394,15 @@ TENCENTCLOUD_CUBEMASTER_REPLICAS='${TENCENTCLOUD_CUBEMASTER_REPLICAS:-1}'
 TENCENTCLOUD_CUBE_API_REPLICAS='${TF_VAR_cube_api_replicas:-${TENCENTCLOUD_CUBE_API_REPLICAS:-1}}'
 TENCENTCLOUD_CUBE_OPS_REPLICAS='${TF_VAR_cube_ops_replicas:-${TENCENTCLOUD_CUBE_OPS_REPLICAS:-2}}'
 TENCENTCLOUD_CUBE_PROXY_REPLICAS='${TF_VAR_cube_proxy_replicas:-${TENCENTCLOUD_CUBE_PROXY_REPLICAS:-1}}'
-TENCENTCLOUD_CUBE_LIFECYCLE_MANAGER_REPLICAS='${TF_VAR_cube_lifecycle_manager_replicas:-${TENCENTCLOUD_CUBE_LIFECYCLE_MANAGER_REPLICAS:-1}}'
+TENCENTCLOUD_CUBE_LIFECYCLE_MANAGER_REPLICAS='${TF_VAR_cube_lifecycle_manager_replicas:-${TENCENTCLOUD_CUBE_LIFECYCLE_MANAGER_REPLICAS:-2}}'
 TENCENTCLOUD_CUBE_WEBUI_REPLICAS='${TF_VAR_cube_webui_replicas:-${TENCENTCLOUD_CUBE_WEBUI_REPLICAS:-1}}'
 TENCENTCLOUD_CUBE_LIFECYCLE_MANAGER_DEFAULT_IDLE_TIMEOUT='${TF_VAR_cube_lifecycle_manager_default_idle_timeout:-${TENCENTCLOUD_CUBE_LIFECYCLE_MANAGER_DEFAULT_IDLE_TIMEOUT:-5m}}'
 TENCENTCLOUD_CUBE_LIFECYCLE_MANAGER_HEARTBEAT_TTL='${TF_VAR_cube_lifecycle_manager_heartbeat_ttl:-${TENCENTCLOUD_CUBE_LIFECYCLE_MANAGER_HEARTBEAT_TTL:-15s}}'
 TENCENTCLOUD_CUBE_LIFECYCLE_MANAGER_DISCOVERY_REFRESH='${TF_VAR_cube_lifecycle_manager_discovery_refresh:-${TENCENTCLOUD_CUBE_LIFECYCLE_MANAGER_DISCOVERY_REFRESH:-3s}}'
+TENCENTCLOUD_CUBE_LIFECYCLE_MANAGER_LEADER_ELECTION_ENABLED='${TF_VAR_cube_lifecycle_manager_leader_election_enabled:-${TENCENTCLOUD_CUBE_LIFECYCLE_MANAGER_LEADER_ELECTION_ENABLED:-true}}'
+TENCENTCLOUD_CUBE_LIFECYCLE_MANAGER_LEADER_LEASE_TTL='${TF_VAR_cube_lifecycle_manager_leader_lease_ttl:-${TENCENTCLOUD_CUBE_LIFECYCLE_MANAGER_LEADER_LEASE_TTL:-10s}}'
+TENCENTCLOUD_CUBE_LIFECYCLE_MANAGER_LEADER_RENEW_INTERVAL='${TF_VAR_cube_lifecycle_manager_leader_renew_interval:-${TENCENTCLOUD_CUBE_LIFECYCLE_MANAGER_LEADER_RENEW_INTERVAL:-3s}}'
+TENCENTCLOUD_CUBE_LIFECYCLE_MANAGER_LEADER_RETRY_INTERVAL='${TF_VAR_cube_lifecycle_manager_leader_retry_interval:-${TENCENTCLOUD_CUBE_LIFECYCLE_MANAGER_LEADER_RETRY_INTERVAL:-1s}}'
 TENCENTCLOUD_CUBE_ADMIN_TOKEN='${TF_VAR_cube_admin_token:-${TENCENTCLOUD_CUBE_ADMIN_TOKEN:-}}'
 TENCENTCLOUD_CUBE_PROXY_HEARTBEAT_INTERVAL_MS='${TF_VAR_cube_proxy_heartbeat_interval_ms:-${TENCENTCLOUD_CUBE_PROXY_HEARTBEAT_INTERVAL_MS:-5000}}'
 TENCENTCLOUD_CUBE_PROXY_ADMIN_PORT='${TF_VAR_cube_proxy_admin_port:-${TENCENTCLOUD_CUBE_PROXY_ADMIN_PORT:-8082}}'
@@ -4602,11 +4613,15 @@ write_resolved_tfvars_file() {
 		--argjson cube_api_replicas "$(_number_or_default "${TF_VAR_cube_api_replicas:-${TENCENTCLOUD_CUBE_API_REPLICAS:-1}}" 1)" \
 		--argjson cube_ops_replicas "$(_number_or_default "${TF_VAR_cube_ops_replicas:-${TENCENTCLOUD_CUBE_OPS_REPLICAS:-2}}" 2)" \
 		--argjson cube_proxy_replicas "$(_number_or_default "${TF_VAR_cube_proxy_replicas:-${TENCENTCLOUD_CUBE_PROXY_REPLICAS:-1}}" 1)" \
-		--argjson cube_lifecycle_manager_replicas "$(_number_or_default "${TF_VAR_cube_lifecycle_manager_replicas:-${TENCENTCLOUD_CUBE_LIFECYCLE_MANAGER_REPLICAS:-1}}" 1)" \
+		--argjson cube_lifecycle_manager_replicas "$(_number_or_default "${TF_VAR_cube_lifecycle_manager_replicas:-${TENCENTCLOUD_CUBE_LIFECYCLE_MANAGER_REPLICAS:-2}}" 2)" \
 		--argjson cube_webui_replicas "$(_number_or_default "${TF_VAR_cube_webui_replicas:-${TENCENTCLOUD_CUBE_WEBUI_REPLICAS:-1}}" 1)" \
 		--arg cube_lifecycle_manager_default_idle_timeout "${TF_VAR_cube_lifecycle_manager_default_idle_timeout:-${TENCENTCLOUD_CUBE_LIFECYCLE_MANAGER_DEFAULT_IDLE_TIMEOUT:-5m}}" \
 		--arg cube_lifecycle_manager_heartbeat_ttl "${TF_VAR_cube_lifecycle_manager_heartbeat_ttl:-${TENCENTCLOUD_CUBE_LIFECYCLE_MANAGER_HEARTBEAT_TTL:-15s}}" \
 		--arg cube_lifecycle_manager_discovery_refresh "${TF_VAR_cube_lifecycle_manager_discovery_refresh:-${TENCENTCLOUD_CUBE_LIFECYCLE_MANAGER_DISCOVERY_REFRESH:-3s}}" \
+		--argjson cube_lifecycle_manager_leader_election_enabled "$(_bool_json "${TF_VAR_cube_lifecycle_manager_leader_election_enabled:-${TENCENTCLOUD_CUBE_LIFECYCLE_MANAGER_LEADER_ELECTION_ENABLED:-true}}")" \
+		--arg cube_lifecycle_manager_leader_lease_ttl "${TF_VAR_cube_lifecycle_manager_leader_lease_ttl:-${TENCENTCLOUD_CUBE_LIFECYCLE_MANAGER_LEADER_LEASE_TTL:-10s}}" \
+		--arg cube_lifecycle_manager_leader_renew_interval "${TF_VAR_cube_lifecycle_manager_leader_renew_interval:-${TENCENTCLOUD_CUBE_LIFECYCLE_MANAGER_LEADER_RENEW_INTERVAL:-3s}}" \
+		--arg cube_lifecycle_manager_leader_retry_interval "${TF_VAR_cube_lifecycle_manager_leader_retry_interval:-${TENCENTCLOUD_CUBE_LIFECYCLE_MANAGER_LEADER_RETRY_INTERVAL:-1s}}" \
 		--arg cube_admin_token "${TF_VAR_cube_admin_token:-${TENCENTCLOUD_CUBE_ADMIN_TOKEN:-}}" \
 		--argjson cube_proxy_heartbeat_interval_ms "$(_number_or_default "${TF_VAR_cube_proxy_heartbeat_interval_ms:-${TENCENTCLOUD_CUBE_PROXY_HEARTBEAT_INTERVAL_MS:-5000}}" 5000)" \
 		--argjson cube_proxy_admin_port "$(_number_or_default "${TF_VAR_cube_proxy_admin_port:-${TENCENTCLOUD_CUBE_PROXY_ADMIN_PORT:-8082}}" 8082)" \
@@ -4659,6 +4674,10 @@ write_resolved_tfvars_file() {
 			cube_lifecycle_manager_default_idle_timeout: $cube_lifecycle_manager_default_idle_timeout,
 			cube_lifecycle_manager_heartbeat_ttl: $cube_lifecycle_manager_heartbeat_ttl,
 			cube_lifecycle_manager_discovery_refresh: $cube_lifecycle_manager_discovery_refresh,
+			cube_lifecycle_manager_leader_election_enabled: $cube_lifecycle_manager_leader_election_enabled,
+			cube_lifecycle_manager_leader_lease_ttl: $cube_lifecycle_manager_leader_lease_ttl,
+			cube_lifecycle_manager_leader_renew_interval: $cube_lifecycle_manager_leader_renew_interval,
+			cube_lifecycle_manager_leader_retry_interval: $cube_lifecycle_manager_leader_retry_interval,
 			cube_admin_token: $cube_admin_token,
 			cube_proxy_heartbeat_interval_ms: $cube_proxy_heartbeat_interval_ms,
 			cube_proxy_admin_port: $cube_proxy_admin_port,

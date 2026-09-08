@@ -829,6 +829,23 @@ resource "kubernetes_deployment" "cube_lifecycle_manager" {
       }
 
       spec {
+        # Prefer spreading the replicas across nodes so a node failure cannot
+        # take both down. Preferred rather than required: a single-node TKE
+        # cluster must still be able to schedule both.
+        affinity {
+          pod_anti_affinity {
+            preferred_during_scheduling_ignored_during_execution {
+              weight = 100
+              pod_affinity_term {
+                label_selector {
+                  match_labels = { app = "cube-lifecycle-manager" }
+                }
+                topology_key = "kubernetes.io/hostname"
+              }
+            }
+          }
+        }
+
         container {
           name  = "cube-lifecycle-manager"
           image = local.cube_lcm_image
@@ -876,6 +893,26 @@ resource "kubernetes_deployment" "cube_lifecycle_manager" {
             name  = "CUBE_LCM_DISCOVERY_REFRESH"
             value = var.cube_lifecycle_manager_discovery_refresh
           }
+          # Active-standby. Both replicas consume lifecycle events and serve
+          # /internal/resume; the Redis lease only gates idle sweep/kill and
+          # stale cube-proxy pruning. Without these the replicas would all
+          # report themselves leader and run singleton work uncoordinated.
+          env {
+            name  = "CUBE_LCM_LEADER_ELECTION_ENABLED"
+            value = var.cube_lifecycle_manager_leader_election_enabled ? "true" : "false"
+          }
+          env {
+            name  = "CUBE_LCM_LEADER_LEASE_TTL"
+            value = var.cube_lifecycle_manager_leader_lease_ttl
+          }
+          env {
+            name  = "CUBE_LCM_LEADER_RENEW_INTERVAL"
+            value = var.cube_lifecycle_manager_leader_renew_interval
+          }
+          env {
+            name  = "CUBE_LCM_LEADER_RETRY_INTERVAL"
+            value = var.cube_lifecycle_manager_leader_retry_interval
+          }
           env {
             name = "CUBE_LCM_ADMIN_TOKEN"
             value_from {
@@ -909,6 +946,28 @@ resource "kubernetes_deployment" "cube_lifecycle_manager" {
           }
         }
       }
+    }
+  }
+
+  lifecycle {
+    # Both directions matter, and they fail differently.
+    precondition {
+      condition = !var.cube_lifecycle_manager_leader_election_enabled || var.cube_lifecycle_manager_replicas >= 2
+      error_message = join("", [
+        "cube_lifecycle_manager_leader_election_enabled=true requires ",
+        "cube_lifecycle_manager_replicas >= 2; a single replica has nothing to fail over to.",
+      ])
+    }
+    # The dangerous direction: several replicas with election off all report
+    # themselves leader, so each one independently runs the idle sweep and
+    # pushes to every cube-proxy. Redis state locks keep that from corrupting
+    # anything, but it is duplicated work, not high availability.
+    precondition {
+      condition = var.cube_lifecycle_manager_leader_election_enabled || var.cube_lifecycle_manager_replicas == 1
+      error_message = join("", [
+        "cube_lifecycle_manager_replicas > 1 requires ",
+        "cube_lifecycle_manager_leader_election_enabled=true; otherwise every replica runs singleton work.",
+      ])
     }
   }
 

@@ -373,9 +373,9 @@ variable "cube_proxy_replicas" {
 }
 
 variable "cube_lifecycle_manager_replicas" {
-  description = "cube-lifecycle-manager Deployment replica count. Keep 1 unless CLM HA behavior has been validated for the target deployment."
+  description = "cube-lifecycle-manager Deployment replica count. Two replicas run active-standby when cube_lifecycle_manager_leader_election_enabled is true; set to 1 only after also disabling leader election."
   type        = number
-  default     = 1
+  default     = 2
 
   validation {
     condition     = var.cube_lifecycle_manager_replicas >= 1 && floor(var.cube_lifecycle_manager_replicas) == var.cube_lifecycle_manager_replicas
@@ -424,6 +424,54 @@ variable "cube_lifecycle_manager_discovery_refresh" {
   validation {
     condition     = can(regex("^[0-9]+(ns|us|µs|ms|s|m|h)$", var.cube_lifecycle_manager_discovery_refresh))
     error_message = "cube_lifecycle_manager_discovery_refresh must be a Go duration such as 3s, 1m, or 1h."
+  }
+}
+
+# Leader election. Both replicas consume lifecycle events and serve resume
+# requests; the Redis lease only gates singleton work (idle sweep/kill and
+# stale cube-proxy pruning). Mirrors lifecycleManager.leaderElection in
+# deploy/kubernetes/chart/values.yaml — keep the two in sync.
+#
+# The inter-value constraints (renew < ttl/2, 0 < retry < ttl) are enforced by
+# cube-lifecycle-manager's own config.Validate() at startup, which fails fast
+# with an explicit message. Terraform cannot compare Go duration strings
+# without parsing them, so they are documented rather than re-checked here.
+variable "cube_lifecycle_manager_leader_election_enabled" {
+  description = "Run cube-lifecycle-manager as active-standby using a Redis lease. Requires cube_lifecycle_manager_replicas >= 2."
+  type        = bool
+  default     = true
+}
+
+variable "cube_lifecycle_manager_leader_lease_ttl" {
+  description = "Redis lease TTL for cube-lifecycle-manager leader election. Bounds how long a crashed leader blocks takeover."
+  type        = string
+  default     = "10s"
+
+  validation {
+    condition     = can(regex("^[0-9]+(ns|us|µs|ms|s|m|h)$", var.cube_lifecycle_manager_leader_lease_ttl))
+    error_message = "cube_lifecycle_manager_leader_lease_ttl must be a Go duration such as 10s, 30s, or 1m."
+  }
+}
+
+variable "cube_lifecycle_manager_leader_renew_interval" {
+  description = "How often the cube-lifecycle-manager leader renews its lease. Must be less than half of cube_lifecycle_manager_leader_lease_ttl."
+  type        = string
+  default     = "3s"
+
+  validation {
+    condition     = can(regex("^[0-9]+(ns|us|µs|ms|s|m|h)$", var.cube_lifecycle_manager_leader_renew_interval))
+    error_message = "cube_lifecycle_manager_leader_renew_interval must be a Go duration such as 3s, 1s, or 500ms."
+  }
+}
+
+variable "cube_lifecycle_manager_leader_retry_interval" {
+  description = "How often a cube-lifecycle-manager standby retries acquiring the lease. Must be greater than 0 and less than cube_lifecycle_manager_leader_lease_ttl."
+  type        = string
+  default     = "1s"
+
+  validation {
+    condition     = can(regex("^[0-9]+(ns|us|µs|ms|s|m|h)$", var.cube_lifecycle_manager_leader_retry_interval))
+    error_message = "cube_lifecycle_manager_leader_retry_interval must be a Go duration such as 1s, 2s, or 500ms."
   }
 }
 
